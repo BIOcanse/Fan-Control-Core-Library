@@ -29,20 +29,31 @@ public sealed class FanCore : IDisposable
     /// <summary>被我们固定过的风扇。退出时要把它们交还固件。</summary>
     private readonly HashSet<int> overridden = [];
 
-    public FanCore()
+    private readonly TemporaryTakeoverJournal? journal;
+    private bool recoveryReady;
+    public bool CrashRecoveryEnabled => journal is not null;
+    public IReadOnlyList<string> Diagnostics => candidates.SelectMany(candidate => candidate.Diagnostics)
+        .Concat(engine?.Diagnostics ?? [])
+        .Concat(active is not null && !recoveryReady && unavailableReason is not null ? [unavailableReason] : Array.Empty<string>()).ToArray();
+
+    public FanCore() : this(FanCoreOptions.FromEnvironment()) { }
+
+    public FanCore(FanCoreOptions options)
     {
+        journal = string.IsNullOrWhiteSpace(options.StateDirectory) ? null : new(options);
         // **一级路由**：按平台筛，按通道类别排。这一步只看这台机器是什么系统，
         // 不碰任何硬件 —— 碰硬件是二级路由（各后端的识别依据）的事。
         var platform = OperatingSystem.IsLinux() ? FanPlatform.Linux : FanPlatform.Windows;
-        foreach (var route in FanChannelRoute.For(platform))
+        foreach (var route in FanChannelRoute.For(platform, options))
         {
             candidates.Add(route.Create());
         }
     }
 
     /// <summary>Explicit backend selection for embedding and isolated testing.</summary>
-    public FanCore(IFanBackend backend)
+    public FanCore(IFanBackend backend, FanCoreOptions? options = null)
     {
+        journal = string.IsNullOrWhiteSpace(options?.StateDirectory) ? null : new(options);
         candidates.Add(backend ?? throw new ArgumentNullException(nameof(backend)));
     }
 
@@ -73,6 +84,7 @@ public sealed class FanCore : IDisposable
             {
                 active = candidate;
                 unavailableReason = null;
+                EnsureRecovery(out _);
                 return true;
             }
             reasons.Add($"{candidate.Name}：{reason ?? "不可用"}");
@@ -109,6 +121,7 @@ public sealed class FanCore : IDisposable
             failureReason = unavailableReason ?? "没有可用的风扇通道。";
             return false;
         }
+        if (!PrepareTemporaryTakeover(fanIndex, out failureReason)) return false;
         if (engine?.IsRunning(fanIndex) == true && !engine.TryStop(fanIndex, out failureReason)) return false;
         if (!active.TrySetDuty(fanIndex, percent, out failureReason))
         {
@@ -128,6 +141,7 @@ public sealed class FanCore : IDisposable
             failureReason = unavailableReason ?? "没有可用的风扇通道。";
             return false;
         }
+        if (!PrepareTemporaryTakeover(fanIndex, out failureReason)) return false;
         if (engine?.IsRunning(fanIndex) == true && !engine.TryStop(fanIndex, out failureReason)) return false;
         if (!active.TrySetFullSpeed(fanIndex, out failureReason))
         {
@@ -144,12 +158,14 @@ public sealed class FanCore : IDisposable
             failureReason = unavailableReason ?? "没有可用的风扇通道。";
             return false;
         }
+        if (!EnsureRecovery(out failureReason)) return false;
         if (engine?.IsRunning(fanIndex) == true && !engine.TryStop(fanIndex, out failureReason)) return false;
         if (!(resetFirmwareCurve ? active.TryResetFirmwareCurve(fanIndex, out failureReason)
             : active.TrySetAutomatic(fanIndex, out failureReason)))
         {
             return false;
         }
+        journal?.Released(active, fanIndex);
         overridden.Remove(fanIndex);
         return true;
     }
@@ -194,6 +210,7 @@ public sealed class FanCore : IDisposable
             return false;
         }
 
+        if (!EnsureRecovery(out failureReason)) return false;
         var described = Describe().FirstOrDefault(fan => fan.Index == fanIndex);
         if (described is null)
         {
@@ -226,6 +243,7 @@ public sealed class FanCore : IDisposable
                 if (active.HasPendingTemporaryRestore(fanIndex)) overridden.Add(fanIndex);
                 return false;
             }
+            journal?.Released(active, fanIndex);
             overridden.Remove(fanIndex);
             return true;
         }
@@ -261,7 +279,8 @@ public sealed class FanCore : IDisposable
             return false;
         }
 
-        engine ??= new SoftwareCurveEngine(active);
+        if (!PrepareTemporaryTakeover(fanIndex, out failureReason)) return false;
+        engine ??= new SoftwareCurveEngine(active) { DiagnosticSink = detail => DiagnosticSink?.Invoke(detail) };
         var plan = new SoftwareCurvePlan(
             fanIndex,
             curve,
@@ -297,6 +316,9 @@ public sealed class FanCore : IDisposable
     }
 
     private SoftwareCurveEngine? engine;
+    public Action<string>? DiagnosticSink { get; set; }
+    private string? lifecycleOperation;
+    public string? InFlightOperation => engine?.InFlightOperation ?? Volatile.Read(ref lifecycleOperation);
 
     /// <summary>
     /// 退出即恢复。
@@ -317,13 +339,60 @@ public sealed class FanCore : IDisposable
         {
             try
             {
-                if (active.TryReleaseOverride(fanIndex, out _)) overridden.Remove(fanIndex);
+                lifecycleOperation = $"shutdown release fan {fanIndex} ({active.Name})";
+                if (active.TryReleaseOverride(fanIndex, out _))
+                {
+                    journal?.Released(active, fanIndex);
+                    overridden.Remove(fanIndex);
+                }
             }
             catch (Exception)
             {
                 // Keep the failed ownership for retry, and still release the other fans.
             }
+            finally { lifecycleOperation = null; }
         }
+    }
+
+    private bool EnsureRecovery(out string? failure)
+    {
+        failure = null;
+        if (recoveryReady || active is null) return true;
+        if (journal is not null && !journal.TryRecover(active, out failure))
+        {
+            unavailableReason = failure;
+            return false;
+        }
+        // Existing Uniwill state also carries incomplete/temporary table ownership across exits.
+        // Completed persistent curves do not report pending temporary restoration.
+        foreach (var fan in active.Describe())
+        {
+            if (!active.HasPendingTemporaryRestore(fan.Index)) continue;
+            if (!active.TryReleaseOverride(fan.Index, out failure))
+            {
+                unavailableReason = failure ?? "Fan temporary baseline recovery was not confirmed.";
+                return false;
+            }
+        }
+        recoveryReady = true;
+        unavailableReason = null;
+        return true;
+    }
+
+    private bool PrepareTemporaryTakeover(int fanIndex, out string? failure)
+    {
+        if (!EnsureRecovery(out failure)) return false;
+        var fan = active!.Describe().FirstOrDefault(fan => fan.Index == fanIndex);
+        if (fan is null) { failure = "没有这个风扇。"; return false; }
+        if (journal is null) return true; // Legacy hosts without durable state keep their existing ownership behavior.
+        var affected = fan.SoftwareTakeoverCoversAllFans
+            ? active.Describe().Where(fan => fan.Writable).Select(fan => fan.Index).ToArray()
+            : new[] { fanIndex };
+        if (journal is not null && !journal.TryRecord(active, affected, out failure)) return false;
+        // Record in memory before the first attempt too: a failed native call may have partly written.
+        foreach (var index in affected) overridden.Add(index);
+        failure = null;
+        return true;
     }
 
     public void Dispose()
@@ -335,9 +404,14 @@ public sealed class FanCore : IDisposable
         disposed = true;
         engine?.Dispose();
         RestoreAll();
-        foreach (var candidate in candidates)
+        try
         {
-            candidate.Dispose();
+            foreach (var candidate in candidates)
+            {
+                lifecycleOperation = $"dispose backend {candidate.Name}";
+                candidate.Dispose();
+            }
         }
+        finally { lifecycleOperation = null; journal?.Dispose(); }
     }
 }

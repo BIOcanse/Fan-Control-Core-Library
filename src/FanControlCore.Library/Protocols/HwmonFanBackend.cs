@@ -22,6 +22,13 @@ public sealed class HwmonFanBackend : IFanBackend
     private readonly List<HwmonFan> fans = [];
 
     public string Name => "hwmon";
+    public string? RecoveryIdentity(int fanIndex)
+    {
+        if (fanIndex < 0 || fanIndex >= fans.Count || fans[fanIndex].DutyPath is not { } duty) return null;
+        var device = new DirectoryInfo(Path.GetDirectoryName(duty)!);
+        var physical = device.ResolveLinkTarget(returnFinalTarget: true)?.FullName ?? device.FullName;
+        return Path.Combine(physical, Path.GetFileName(duty));
+    }
 
     public bool TryOpen(out string? unavailableReason)
     {

@@ -11,7 +11,7 @@ namespace FanControlCore.Transport;
 /// （厂商控制中心、监控软件，以及**用这个核心的宿主程序自己**）。
 /// 所以锁要跨进程，名字按**通道**取 —— 谁用这条通道谁就用这把锁。
 ///
-/// 拿不到全局名字（权限不够）就退到进程内，这时至少本进程内部是串行的。
+/// 拿不到全局名字时沿用会话内互斥；此限制随 describe diagnostics 明确报告。
 /// </summary>
 public sealed class EcChannelLock : IDisposable
 {
@@ -21,13 +21,16 @@ public sealed class EcChannelLock : IDisposable
     /// </summary>
     private static readonly TimeSpan WaitTimeout = TimeSpan.FromSeconds(5);
 
+    public string? Diagnostic { get; }
     private readonly Mutex mutex;
     private bool disposed;
 
     public EcChannelLock(string channelName)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(channelName);
-        mutex = Create($@"Global\{channelName}") ?? new Mutex(false, $@"Local\{channelName}");
+        var global = Create($@"Global\{channelName}");
+        if (global is null) Diagnostic = "Global EC mutex unavailable; using the existing session-local EC mutex. Cross-session serialization is unavailable.";
+        mutex = global ?? new Mutex(false, $@"Local\{channelName}");
     }
 
     /// <summary>

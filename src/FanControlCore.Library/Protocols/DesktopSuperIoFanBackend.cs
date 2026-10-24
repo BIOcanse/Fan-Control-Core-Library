@@ -39,10 +39,17 @@ public sealed class DesktopSuperIoFanBackend : IFanBackend
 
     private const string LibraryFileName = "LibreHardwareMonitorLib.dll";
 
+    private readonly string? libraryPath;
+    public DesktopSuperIoFanBackend() : this(Environment.GetEnvironmentVariable(LibraryPathVariable)) { }
+    public DesktopSuperIoFanBackend(string? libraryPath) => this.libraryPath = libraryPath;
     private object? computer;
     private readonly List<Channel> channels = [];
 
     public string Name => "desktop-superio";
+    public string? RecoveryIdentity(int fanIndex)
+        => fanIndex >= 0 && fanIndex < channels.Count
+            ? channels[fanIndex].Control.GetType().GetProperty("Identifier")?.GetValue(channels[fanIndex].Control)?.ToString()
+            : null;
 
     public bool TryOpen(out string? unavailableReason)
     {
@@ -183,9 +190,9 @@ public sealed class DesktopSuperIoFanBackend : IFanBackend
         }
     }
 
-    private static string? ResolveLibrary()
+    private string? ResolveLibrary()
     {
-        var root = Environment.GetEnvironmentVariable(LibraryPathVariable);
+        var root = libraryPath;
         if (string.IsNullOrWhiteSpace(root))
         {
             return null;

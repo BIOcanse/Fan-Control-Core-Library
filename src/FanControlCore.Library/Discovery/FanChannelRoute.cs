@@ -78,7 +78,7 @@ public sealed record FanChannelRoute(
     /// 和别家区分开的东西 —— 固件接口在不在、固件指纹认不认，
     /// **不能是"试着写一下看行不行"**。
     /// </summary>
-    public static IReadOnlyList<FanChannelRoute> For(FanPlatform platform)
+    public static IReadOnlyList<FanChannelRoute> For(FanPlatform platform, FanCoreOptions? options = null)
     {
         var routes = new List<FanChannelRoute>();
         if (platform == FanPlatform.Linux && OperatingSystem.IsLinux())
@@ -89,7 +89,7 @@ public sealed record FanChannelRoute(
         }
         if (platform == FanPlatform.Windows && OperatingSystem.IsWindows())
         {
-            routes.AddRange(WindowsRoutes.All);
+            routes.AddRange(WindowsRoutes.Create(options ?? FanCoreOptions.FromEnvironment()));
         }
         routes.Sort((left, right) => left.Category.CompareTo(right.Category));
         return routes;
@@ -103,7 +103,7 @@ public sealed record FanChannelRoute(
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
     private static class WindowsRoutes
     {
-        public static IReadOnlyList<FanChannelRoute> All { get; } =
+        public static IReadOnlyList<FanChannelRoute> Create(FanCoreOptions options) =>
         [
             // 厂商固件接口。识别依据都是各家固件自己的 WMI 接口在不在 ——
             // GUID 是固件里写死的，各家互不重叠，所以最多命中一条。
@@ -115,16 +115,16 @@ public sealed record FanChannelRoute(
              * 识别依据：能不能枚举到可写的接头。笔记本上枚举不到（风扇在整机 EC 上），
              * 所以它和下面那几条笔记本通道天然不重叠。
              */
-            new(FanChannelCategory.SuperIo, static () => new DesktopSuperIoFanBackend()),
+            new(FanChannelCategory.SuperIo, () => new DesktopSuperIoFanBackend(options.LibreHardwareMonitorPath)),
 
             new(FanChannelCategory.VendorFirmware, static () => new AsusWmiFanBackend()),
             new(FanChannelCategory.VendorFirmware, static () => new HpWmiFanBackend()),
-            new(FanChannelCategory.VendorFirmware, static () => new LenovoWmiFanBackend()),
+            new(FanChannelCategory.VendorFirmware, () => new LenovoWmiFanBackend(options.StateDirectory)),
             new(FanChannelCategory.VendorFirmware, static () => new AcerWmiFanBackend()),
 
             // 同方公版：借道固件的 ACPI WMI 方法，但读写的是 EC 寄存器，
             // 所以归 Raw EC 那一类 —— 规矩也按那一类办：固件指纹认不出就只读。
-            new(FanChannelCategory.RawEc, static () => new UniwillWmiFanBackend())
+            new(FanChannelCategory.RawEc, () => new UniwillWmiFanBackend(options.StateDirectory))
         ];
     }
 }

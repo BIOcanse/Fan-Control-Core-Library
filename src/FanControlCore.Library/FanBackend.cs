@@ -186,6 +186,14 @@ public interface IFanBackend : IDisposable
 {
     /// <summary>这条通道的名字，出现在 describe 里，方便用户和我们自己定位问题。</summary>
     string Name { get; }
+    IReadOnlyList<string> Diagnostics => [];
+
+    /// <summary>Stable channel identity independent of enumeration order; ambiguous identities block recovery.</summary>
+    string? RecoveryIdentity(int fanIndex)
+    {
+        var fan = Describe().FirstOrDefault(fan => fan.Index == fanIndex);
+        return fan is null ? null : fan.Name + "\n" + fan.Role + "\n" + fan.FirmwareCurve;
+    }
 
     /// <summary>
     /// 这台机器上这条通道能不能用。

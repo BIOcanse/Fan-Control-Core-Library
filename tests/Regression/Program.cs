@@ -5,10 +5,14 @@ using FanControlCore;
 using FanControlCore.Discovery;
 using FanControlCore.Policy;
 
+if (args is ["--crash-takeover", var crashRoot]) { CrashRecoveryTests.RecordAndExit(crashRoot); return; }
+
 static void Check(bool result, string message) { if (!result) throw new Exception(message); }
 static void Until(Func<bool> ready, string message) { Check(SpinWait.SpinUntil(ready, 3000), message); }
 try
 {
+    CrashRecoveryTests.Run();
+    CurveIsolationTests.Run();
     var curve = new FanCurvePoint[] { new(60, 35), new(95, 100) };
 
     foreach (var action in new[] { "set", "boost", "auto" })

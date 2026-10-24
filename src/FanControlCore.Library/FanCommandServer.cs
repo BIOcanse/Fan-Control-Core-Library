@@ -43,7 +43,7 @@ public static class FanCommandServer
         command?.GetAwaiter().GetResult();
     }
 
-    static Dictionary<string, object?> Handle(FanCore core, string line)
+    public static Dictionary<string, object?> Handle(FanCore core, string line)
     {
         long id = 0;
         try
@@ -75,6 +75,8 @@ public static class FanCommandServer
                          * 白占一条订阅和十倍的往返。
                          */
                         ["needsTemperatures"] = core.NeedsTemperatures,
+                        ["crashRecoveryEnabled"] = core.CrashRecoveryEnabled,
+                        ["diagnostics"] = core.Diagnostics,
                         ["temperatureNotifications"] = true
                     });
 

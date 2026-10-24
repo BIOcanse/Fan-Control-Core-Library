@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>FanControlCore.Library</AssemblyName>
+    <RootNamespace>FanControlCore</RootNamespace>
+    <Version>0.1.0-dev.4</Version>
+    <PackageId>FanControlCore.Library</PackageId>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <Authors>BIOcanse</Authors>
+    <Description>Cross-platform fan discovery, control protocols and recoverable hosting library.</Description>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="System.Management" Version="10.0.2" />
+    <InternalsVisibleTo Include="FanControlCore.RegressionTests" />
+  </ItemGroup>
+</Project>

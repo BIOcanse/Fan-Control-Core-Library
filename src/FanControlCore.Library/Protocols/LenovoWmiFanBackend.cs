@@ -101,6 +101,8 @@ public sealed partial class LenovoWmiFanBackend : IFanBackend
     public LenovoWmiFanBackend() : this(new LenovoFanHardware(),
         Environment.GetEnvironmentVariable("FANCONTROLCORE_STATE_DIRECTORY")) { }
 
+    public LenovoWmiFanBackend(string? baselineDirectory) : this(new LenovoFanHardware(), baselineDirectory) { }
+
     internal LenovoWmiFanBackend(ILenovoFanHardware hardware, string? baselineDirectory)
     {
         this.hardware = hardware;

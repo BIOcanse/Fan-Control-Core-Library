@@ -25,7 +25,7 @@ For example, send `{"id":1,"op":"describe"}` followed by a newline. Replies incl
 
 The Windows source contains WMI backends for ASUS, HP, Lenovo, and Acer, plus a Uniwill WMI/EC backend. Linux uses the kernel's `hwmon` interface. Availability and supported operations depend on the particular firmware and device. Only the Uniwill path has been exercised on physical hardware for this release; the other backends should not be taken as hardware-validated compatibility claims. HID and SMM backends are not implemented.
 
-On normal shutdown, the helper attempts to return fans it has overridden to automatic control. Abrupt termination or a failed firmware command can prevent restoration. Confirm that your device supports the requested operation before using manual fan control.
+On normal shutdown, the host attempts to return temporary fan takeovers to automatic control. With an explicit state directory, the library records temporary ownership before writing and the next host session restores it before allowing new writes. Abrupt termination leaves the last hardware state in place until that next session; firmware/driver failures may prevent recovery. Confirm that your device supports the requested operation before using manual fan control.
 
 ## Build
 
@@ -61,8 +61,19 @@ These restoration paths have regression coverage with injected EC/WMI transports
 
 ## Restoration failures
 
-A release that returns false or throws an exception remains a failed restoration. The software engine retains the existing restoring entry and retries it on its next tick; the old curve is no longer active. StopAll and the core's RestoreAll continue with the other fans and retain failed ownership for an explicit later retry. Shutdown still attempts restoration, but this does not guarantee recovery from permanent backend faults or abrupt process termination.
+A release that returns false or throws an exception remains a failed restoration. The software engine retains the existing restoring entry and retries it on its next tick; the old curve is no longer active. StopAll and the core's RestoreAll continue with the other fans and retain failed ownership for an explicit later retry. Shutdown still attempts restoration. Durable restart recovery preserves unresolved ownership and rejects new writes while restoration fails; permanent backend faults require intervention.
 
 ## Curve receipts
 
 Curve read and write receipts describe the actual execution with the existing `execution` field. Firmware table receipts may be cached until a write, cancellation or detection reset. Software receipts come from the active core plan and must be read again because a lost temperature feed or manual action may end that plan. An unsuccessful or incomplete receipt cannot confirm application. The regression runner uses only fake backends, never hardware.
+## Library hosting and local packages
+
+`src/FanControlCore.Library` contains discovery, protocols, transports, policy, profiles and `FanCommandServer`. `src/FanControlCore` remains the thin cross-platform stdio executable. Both use the same command implementation. `FanControlSession` accepts JSON requests directly and is disposable; command callers serialize hardware operations while temperature publication may proceed independently. Supply `FanCoreOptions(StateDirectory, LibreHardwareMonitorPath)` explicitly when embedding instead of changing process environment variables. The stdio host continues to read the existing `FANCONTROLCORE_STATE_DIRECTORY` and `FANCONTROLCORE_LHM_PATH` variables.
+
+`dotnet pack src/FanControlCore.Library/FanControlCore.Library.csproj -c Release --disable-build-servers -o artifacts/packages` creates the Apache-2.0 `FanControlCore.Library` package, currently `0.1.0-dev.2`. This is a local review candidate, not a published release. Resource Manager consumes the versioned package through its ordinary local NuGet feed alongside its other SDKs. No cross-repository source inclusion is needed by the backend.
+
+A supplied state directory enables `temporary-takeovers.json`. Records are atomically replaced after a flush to disk and tied to machine, backend and stable fan identity. An exclusive file handle prevents concurrent owners of that directory. Discovery restores pending takeovers before the first new write. Identity mismatch, unavailable hardware, unreadable state or a failed restore preserves the record and blocks new writes; explicit later operations can retry. Enumeration order alone is never used to select a recovery target. The existing Lenovo/Uniwill original-table files remain in the same directory. Uniwill temporary fixed-duty tables are restored from those files, while completed persistent firmware curves remain. Software plans, temperatures and the last duty value are not resumed. Hosts without a state directory retain normal-shutdown-only behavior, reported as `crashRecoveryEnabled:false`.
+
+Restoration success retains each backend's existing meaning: ASUS/HP/Lenovo/Uniwill have their existing mode/table readback, while Acer acknowledges a WMI command, Super I/O relies on LHM `SetDefault`, and hwmon relies on the kernel attribute write. The latter paths do not independently prove physical fan behavior. No code can restore hardware while its host is dead; restart recovery is conditional on a working matching device and durable files.
+
+Managed exceptions can be contained by a host boundary. In-process hosting cannot isolate native access violations, native/COM hangs, process termination, stack overflow, or a faulty kernel/firmware driver. The library has no direct P/Invoke declarations: Windows paths reach COM/WMI and OEM drivers, Super I/O reaches the supplied LHM/PawnIO stack, and Linux reaches hwmon kernel drivers through files. The existing global-to-session-local EC mutex behavior is exposed in `describe.diagnostics`, so hosts can log its cross-session limitation. No new control loops or timers were added.

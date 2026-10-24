@@ -93,6 +93,29 @@ public sealed class SoftwareCurveEngine : IDisposable
     private CancellationTokenSource? cancellation;
     private Task? loop;
     private bool disposed;
+    private string? loopFailure;
+    private readonly Dictionary<string, string> diagnostics = [];
+    public IReadOnlyList<string> Diagnostics { get { lock (gate) return diagnostics.Values.ToArray(); } }
+    public Action<string>? DiagnosticSink { get; set; }
+    private string? inFlightOperation;
+    public string? InFlightOperation => Volatile.Read(ref inFlightOperation);
+    internal Action? BeforeIteration { get; set; }
+
+    private void Report(string key, string detail)
+    {
+        if (diagnostics.TryGetValue(key, out var previous) && previous == detail) return;
+        diagnostics[key] = detail;
+        if (DiagnosticSink is not { } observer) return;
+        // Logging is not a hardware owner. A blocked host observer must not delay release.
+        _ = Task.Run(() =>
+        {
+            try { observer(detail); }
+            catch (Exception error)
+            {
+                lock (gate) diagnostics["observer"] = $"Fan diagnostic callback failed: {error.Message}";
+            }
+        });
+    }
 
     public SoftwareCurveEngine(
         IFanBackend backend,
@@ -161,6 +184,13 @@ public sealed class SoftwareCurveEngine : IDisposable
 
         lock (gate)
         {
+            ObjectDisposedException.ThrowIf(disposed, this);
+            if (loopFailure is not null && running.Count > 0)
+            {
+                failureReason = $"Software curve loop failed; firmware restoration is pending: {loopFailure}";
+                return false;
+            }
+            loopFailure = null;
             if (running.TryGetValue(plan.FanIndex, out var existing))
             {
                 if (existing.Restoring)
@@ -191,18 +221,24 @@ public sealed class SoftwareCurveEngine : IDisposable
         lock (gate)
         {
             if (running.TryGetValue(fanIndex, out var fan)) fan.Restoring = true;
+            inFlightOperation = $"curve release fan {fanIndex}";
             try
             {
-                if (!backend.TryReleaseOverride(fanIndex, out failureReason)) return false;
+                if (!backend.TryReleaseOverride(fanIndex, out failureReason))
+                {
+                    Report($"release:{fanIndex}", $"Fan {fanIndex} release failed; restoration pending: {failureReason ?? "not confirmed"}");
+                    return false;
+                }
+                running.Remove(fanIndex);
+                return true;
             }
             catch (Exception error)
             {
-                // A failed release keeps this entry restoring; the next tick retries it.
                 failureReason = error.Message;
+                Report($"release:{fanIndex}", $"Fan {fanIndex} release failed; restoration pending: {error.Message}");
                 return false;
             }
-            running.Remove(fanIndex);
-            return true;
+            finally { inFlightOperation = null; }
         }
     }
 
@@ -238,42 +274,57 @@ public sealed class SoftwareCurveEngine : IDisposable
 
     private async Task RunAsync(CancellationToken cancellationToken)
     {
-        using var timer = new PeriodicTimer(interval);
-        // while，不递归 —— 这条循环要跑到进程结束。
-        while (!cancellationToken.IsCancellationRequested)
+        // Keep the existing timer. Body faults change this loop to release-only.
+        // Timer faults get a final release pass and an explicit faulted state.
+        try
         {
-            try
+            using var timer = new PeriodicTimer(interval);
+            while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
             {
-                if (!await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
+                try
                 {
-                    return;
+                    BeforeIteration?.Invoke();
+                    FanRuntime[] snapshot;
+                    lock (gate) snapshot = [.. running.Values];
+                    foreach (var fan in snapshot)
+                    {
+                        lock (gate)
+                        {
+                            var index = fan.Plan.FanIndex;
+                            if (!running.TryGetValue(index, out var current) || !ReferenceEquals(current, fan)) continue;
+                            if (fan.Restoring) { TryStop(index, out _); continue; }
+                            try
+                            {
+                                inFlightOperation = $"curve tick fan {index}";
+                                Tick(fan);
+                            }
+                            catch (Exception error)
+                            {
+                                Report($"tick:{index}", $"Fan {index} curve tick failed; handing back to firmware: {error.Message}");
+                                TryStop(index, out _);
+                            }
+                            finally { inFlightOperation = null; }
+                            if (fan.Failures >= 5) TryStop(index, out _);
+                        }
+                    }
                 }
-            }
-            catch (OperationCanceledException)
-            {
-                return;
-            }
-
-            FanRuntime[] snapshot;
-            lock (gate)
-            {
-                snapshot = [.. running.Values];
-            }
-
-            foreach (var fan in snapshot)
-            {
-                // Serialize ownership changes with writes; an old snapshot cannot write after auto/set/boost.
-                lock (gate)
-                {
-                    if (!running.TryGetValue(fan.Plan.FanIndex, out var current) || !ReferenceEquals(current, fan)) continue;
-                    if (fan.Restoring) { TryStop(fan.Plan.FanIndex, out _); continue; }
-                    try { Tick(fan); }
-                    catch (Exception error) when (error is not OperationCanceledException) { fan.Failures++; }
-                    // Both false returns and exceptions must hand back after five consecutive failures.
-                    if (fan.Failures >= 5) TryStop(fan.Plan.FanIndex, out _);
-                }
+                catch (Exception error) { FailLoop(error); }
             }
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
+        catch (Exception error) { FailLoop(error); }
+        finally { StopAll(); }
+    }
+
+    private void FailLoop(Exception error)
+    {
+        lock (gate)
+        {
+            loopFailure = error.Message;
+            foreach (var fan in running.Values) fan.Restoring = true;
+            Report("loop", $"Software curve loop failed; all fans are being handed back to firmware: {error.Message}");
+        }
+        StopAll();
     }
 
     private void Tick(FanRuntime fan)

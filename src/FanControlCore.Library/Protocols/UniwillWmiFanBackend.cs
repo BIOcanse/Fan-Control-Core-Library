@@ -35,6 +35,9 @@ public sealed partial class UniwillWmiFanBackend : IFanBackend
         Environment.GetEnvironmentVariable("FANCONTROLCORE_STATE_DIRECTORY"), FanMachineIdentity.ReadSystemUuid,
         FanMachineIdentity.ReadSystemModel) { }
 
+    public UniwillWmiFanBackend(string? baselineDirectory) : this(new UniwillWmiEcTransport(),
+        baselineDirectory, FanMachineIdentity.ReadSystemUuid, FanMachineIdentity.ReadSystemModel) { }
+
     internal UniwillWmiFanBackend(IUniwillFanHardware transport, string? baselineDirectory, Func<string?> readIdentity,
         Func<(string? Manufacturer, string? Model)>? readSystemModel = null)
     {
@@ -43,6 +46,7 @@ public sealed partial class UniwillWmiFanBackend : IFanBackend
     }
 
     public string Name => "uniwill-wmi-ec";
+    public IReadOnlyList<string> Diagnostics => transport.Diagnostic is { } detail ? [detail] : [];
 
     public bool TryOpen(out string? unavailableReason)
     {
