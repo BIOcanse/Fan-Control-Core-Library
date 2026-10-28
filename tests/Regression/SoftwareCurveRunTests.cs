@@ -92,7 +92,7 @@ internal static class SoftwareCurveRunTests
             var backend = new RunBackend();
             using var core = new FanCore(backend);
             core.Open();
-            core.Temperatures.Push(new Dictionary<string, double> { ["cpu"] = 60 });
+            core.PushTemperatures([new("cpu", 60, DateTime.UtcNow.Ticks)]);
             using var run = new CurveRun(core.RunSoftwareCurveAsync);
             Check(core.TryWriteCurve(0, [new(60, 35)], "software", out _), "plan wakes waiting run");
             Until(() => !backend.Writes.IsEmpty, "run drives before manual action");
@@ -135,7 +135,7 @@ internal static class SoftwareCurveRunTests
                 } };
                 using var core = new FanCore(backend, new(StateDirectory: root, MachineIdentity: () => "run-test"));
                 core.Open();
-                core.Temperatures.Push(new Dictionary<string, double> { ["cpu"] = 60 });
+                core.PushTemperatures([new("cpu", 60, DateTime.UtcNow.Ticks)]);
                 Check(core.TryWriteCurve(0, [new(60, 35)], "software", out _), "record durable-host plan");
                 Check(!File.Exists(journal), "recording does not claim temporary hardware ownership");
                 using var run = new CurveRun(core.RunSoftwareCurveAsync);

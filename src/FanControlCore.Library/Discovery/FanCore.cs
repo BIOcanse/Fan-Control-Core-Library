@@ -200,6 +200,9 @@ public sealed class FanCore : IDisposable
     /// <summary>宿主推过来的温度。软件曲线要用，固件曲线用不上。</summary>
     public FanTemperatureStore Temperatures { get; } = new();
 
+    /// <summary>Atomically replace the pushed temperature batch without JSON conversion.</summary>
+    public void PushTemperatures(IReadOnlyList<FanTemperatureSample> samples) => Temperatures.Push(samples);
+
     /// <summary>
     /// 这台机器的软件曲线要不要宿主推温度。
     ///
@@ -289,30 +292,18 @@ public sealed class FanCore : IDisposable
          * 认不出角色的就看全部、取最热的那一个 ——
          * 共用散热的笔记本上，按最吃紧的那一路走才是对的。
          */
-        var names = Temperatures.Names
-            .Where(name => described.Role switch
-            {
-                FanRoles.Gpu => name.StartsWith("gpu", StringComparison.OrdinalIgnoreCase),
-                FanRoles.Cpu => name.StartsWith("cpu", StringComparison.OrdinalIgnoreCase),
-                _ => true
-            })
-            .ToArray();
-        if (names.Length == 0 || (described.Role != FanRoles.Gpu
-            && !names.Any(name => name.StartsWith("cpu", StringComparison.OrdinalIgnoreCase))))
+        var kind = described.Role switch
         {
-            // 宿主还没推过温度，或者推来的里面没有这把风扇该看的那一路。
-            // **不拿别的温度顶上** —— 按错的温度调速比不调更糟。
-            failureReason = "还没有收到这个风扇要看的温度，软件曲线跑不起来。";
-            return false;
-        }
+            FanRoles.Cpu => FanTemperatureKinds.Cpu,
+            FanRoles.Gpu => FanTemperatureKinds.Gpu,
+            _ => FanTemperatureKinds.Any
+        };
 
         var plan = new SoftwareCurvePlan(
             fanIndex,
             curve,
-            [.. names.Select(name => new FanTemperatureSource(
-                name,
-                () => Temperatures.Read(name),
-                Required: described.Role != FanRoles.Gpu && name.StartsWith("cpu", StringComparison.OrdinalIgnoreCase)))]);
+            [new FanTemperatureSource(kind, () => Temperatures.ReadKind(kind))],
+            TemperatureKind: kind);
         if (!engine!.TryRecordPlan(plan, out failureReason))
         {
             return false;
@@ -346,6 +337,12 @@ public sealed class FanCore : IDisposable
     {
         add => GetEngine().SoftwareCurveRunNeededChanged += value;
         remove { if (engine is not null) engine.SoftwareCurveRunNeededChanged -= value; }
+    }
+    public IReadOnlyList<string> SoftwareCurveTemperatureKinds => engine?.SoftwareCurveTemperatureKinds ?? [];
+    public event Action<IReadOnlyList<string>>? SoftwareCurveTemperatureKindsChanged
+    {
+        add => GetEngine().SoftwareCurveTemperatureKindsChanged += value;
+        remove { if (engine is not null) engine.SoftwareCurveTemperatureKindsChanged -= value; }
     }
 
     /// <summary>Run software plans for the host-controlled lifetime. Only one run may be active.</summary>

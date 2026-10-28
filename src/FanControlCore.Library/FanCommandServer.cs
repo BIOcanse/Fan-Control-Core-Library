@@ -47,7 +47,10 @@ public static class FanCommandServer
     {
         var reply = HandleRequest(core, line, out var operation);
         if (operation is "curve" or "setcurve" or "auto" or "set" or "boost")
+        {
             reply["softwareCurveRunNeeded"] = core.SoftwareCurveRunNeeded;
+            reply["softwareCurveTemperatureKinds"] = core.SoftwareCurveTemperatureKinds;
+        }
         return reply;
     }
 
@@ -105,18 +108,7 @@ public static class FanCommandServer
                      * 推送只是把最新值放进去。两者分开，推送慢了或者停了，
                      * 引擎有自己的失效处理（读不到超过 5 秒就交还固件）。
                      */
-                    var samples = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
-                    if (request.TryGetProperty("samples", out var pushed)
-                        && pushed.ValueKind == JsonValueKind.Object)
-                    {
-                        foreach (var sample in pushed.EnumerateObject())
-                        {
-                            if (sample.Value.ValueKind == JsonValueKind.Number)
-                            {
-                                samples[sample.Name] = sample.Value.GetDouble();
-                            }
-                        }
-                    }
+                    var samples = new List<FanTemperatureSample>();
                     Dictionary<string, long>? observedAt = null;
                     if (request.TryGetProperty("observedAtUtcTicks", out var stamps) && stamps.ValueKind == JsonValueKind.Object)
                     {
@@ -124,7 +116,21 @@ public static class FanCommandServer
                         foreach (var stamp in stamps.EnumerateObject())
                             if (stamp.Value.TryGetInt64(out var ticks)) observedAt[stamp.Name] = ticks;
                     }
-                    core.Temperatures.Push(samples, observedAt);
+                    var now = DateTime.UtcNow.Ticks;
+                    if (request.TryGetProperty("samples", out var pushed)
+                        && pushed.ValueKind == JsonValueKind.Object)
+                    {
+                        foreach (var sample in pushed.EnumerateObject())
+                        {
+                            if (sample.Value.ValueKind == JsonValueKind.Number)
+                            {
+                                var ticks = observedAt is null ? now
+                                    : observedAt.TryGetValue(sample.Name, out var observed) ? observed : 0;
+                                samples.Add(new(sample.Name, sample.Value.GetDouble(), ticks));
+                            }
+                        }
+                    }
+                    core.PushTemperatures(samples);
                     return Ok(id, new Dictionary<string, object?>
                     {
                         ["accepted"] = samples.Count

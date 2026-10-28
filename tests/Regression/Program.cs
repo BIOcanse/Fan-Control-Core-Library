@@ -11,6 +11,7 @@ static void Check(bool result, string message) { if (!result) throw new Exceptio
 static void Until(Func<bool> ready, string message) { Check(SpinWait.SpinUntil(ready, 3000), message); }
 try
 {
+    TemperatureKindTests.Run();
     if (args is ["--review-run-needed"]) { RunEntryReviewTests.RunNeeded(); return; }
     if (args is ["--review-plan-removal"]) { RunEntryReviewTests.PlanRemoval(); return; }
     RunEntryReviewTests.RunNeeded();
@@ -26,7 +27,7 @@ try
         var backend = new FakeBackend();
         using var core = new FanCore(backend);
         Check(core.Open(), "fake backend opens");
-        core.Temperatures.Push(new Dictionary<string, double> { ["cpu"] = 60 });
+        core.PushTemperatures([new("cpu", 60, DateTime.UtcNow.Ticks)]);
         Check(core.TryWriteCurve(0, curve, "software", out _), "software curve starts");
         using var run = new CurveRun(core.RunSoftwareCurveAsync);
         Until(() => backend.Drives > 0, "curve drives fake fan");
@@ -49,7 +50,7 @@ try
             _ => core.TrySetAutomatic(0, out _)
         }, "manual action succeeds");
         var writes = backend.Drives;
-        core.Temperatures.Push(new Dictionary<string, double> { ["cpu"] = 100 });
+        core.PushTemperatures([new("cpu", 100, DateTime.UtcNow.Ticks)]);
         Thread.Sleep(250);
         Check(backend.Drives == writes, $"{action} cannot be overwritten by old software curve");
     }
@@ -67,10 +68,9 @@ try
         var store = new FanTemperatureStore();
         var old = DateTime.UtcNow.AddSeconds(-10).Ticks;
         var now = DateTime.UtcNow.Ticks;
-        store.Push(new Dictionary<string, double> { ["cpu"] = 45, ["gpu0"] = 80 },
-            new Dictionary<string, long> { ["cpu"] = old, ["gpu0"] = now });
+        store.Push([new("cpu", 45, old), new("gpu0", 80, now)]);
         Check(store.Read("cpu") is null && store.Read("gpu0") == 80, "freshness is checked per sensor at observation time");
-        store.Push(new Dictionary<string, double> { ["cpu"] = 45 }, new Dictionary<string, long> { ["cpu"] = old });
+        store.Push([new("cpu", 45, old)]);
         Check(!store.IsFresh && store.Names.Count == 0, "repeated old temperatures cannot renew freshness");
     }
 
@@ -96,10 +96,10 @@ try
         var backend = new FakeBackend { Role = FanRoles.Unknown };
         using var core = new FanCore(backend);
         core.Open();
-        core.Temperatures.Push(new Dictionary<string, double> { ["gpu0"] = 70 });
-        Check(!core.TryWriteCurve(0, curve, "software", out _), "unknown fan refuses GPU-only temperatures");
+        core.PushTemperatures([new("gpu0", 70, DateTime.UtcNow.Ticks)]);
+        Check(core.TryWriteCurve(0, curve, "software", out _), "unknown fan records before required CPU is available");
         Check(backend.Drives == 0, "missing CPU cannot take software ownership");
-        core.Temperatures.Push(new Dictionary<string, double> { ["cpu"] = 60, ["gpu0"] = 70 });
+        core.PushTemperatures([new("cpu", 60, DateTime.UtcNow.Ticks), new("gpu0", 70, DateTime.UtcNow.Ticks)]);
         Check(core.TryWriteCurve(0, curve, "software", out _), "unknown fan starts with CPU and GPU temperatures");
         using var run = new CurveRun(core.RunSoftwareCurveAsync);
         Until(() => backend.Drives > 0, "unknown fan drives with required CPU present");
@@ -117,7 +117,7 @@ try
         Volatile.Write(ref cpuAvailable, 0);
         Thread.Sleep(50);
         var writes = backend.Drives;
-        Check(!engine.TryRecordPlan(plan, out _), "cannot replace a curve when required CPU is missing");
+        Check(engine.TryRecordPlan(plan, out _), "replacement does not require a current CPU observation");
         Check(SpinWait.SpinUntil(() => !engine.IsRunning(0), 6500), "required CPU loss cannot be replaced by fresh GPU; existing blind timeout restores firmware");
         Check(backend.Drives == writes && backend.AutomaticCalls > 0, "no GPU-only writes during CPU loss");
     }

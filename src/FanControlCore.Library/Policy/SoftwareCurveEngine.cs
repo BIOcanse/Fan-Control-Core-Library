@@ -44,7 +44,9 @@ public sealed record SoftwareCurvePlan(
     /// **这不是"替用户改曲线"，是最后一道保护。** 它在界面上是看得见、
     /// 可以调的一项；藏起来的兜底才是问题，明说出来的兜底不是。
     /// </summary>
-    double CriticalCelsius = 95);
+    double CriticalCelsius = 95,
+    /// <summary>The kind this plan reads, used by the host to subscribe temperatures.</summary>
+    string TemperatureKind = FanTemperatureKinds.Any);
 
 /// <summary>
 /// 软件闭环曲线引擎。
@@ -104,48 +106,64 @@ public sealed class SoftwareCurveEngine : IDisposable
     public string? InFlightOperation => Volatile.Read(ref inFlightOperation);
     internal Action? BeforeIteration { get; set; }
     private bool runNeeded;
-    private bool publishingRunNeeded;
-    private readonly Queue<bool> runNeededChanges = new();
+    private bool publishingFacts;
+    private readonly Queue<(bool? RunNeeded, IReadOnlyList<string>? Kinds)> factChanges = new();
+    private IReadOnlyList<string> temperatureKinds = Array.Empty<string>();
     public bool SoftwareCurveRunNeeded { get { lock (gate) return runNeeded; } }
     public event Action<bool>? SoftwareCurveRunNeededChanged;
+    public IReadOnlyList<string> SoftwareCurveTemperatureKinds { get { lock (gate) return temperatureKinds; } }
+    public event Action<IReadOnlyList<string>>? SoftwareCurveTemperatureKindsChanged;
 
     // Called under gate after plan/runtime changes. Queue every transition in mutation order.
-    private void UpdateRunNeeded()
+    private void UpdateFacts()
     {
         var needed = plans.Count > 0 || running.Count > 0;
-        if (needed == runNeeded) return;
+        string[] orderedKinds = [FanTemperatureKinds.Cpu, FanTemperatureKinds.Gpu, FanTemperatureKinds.Any];
+        var kinds = orderedKinds.Where(kind => plans.Values.Any(plan => plan.TemperatureKind == kind)).ToArray();
+        var kindsChanged = !temperatureKinds.SequenceEqual(kinds);
+        var neededChanged = needed != runNeeded;
+        if (!neededChanged && !kindsChanged) return;
         runNeeded = needed;
-        runNeededChanges.Enqueue(needed);
+        if (kindsChanged) temperatureKinds = Array.AsReadOnly(kinds);
+        factChanges.Enqueue((neededChanged ? needed : null, kindsChanged ? temperatureKinds : null));
     }
 
     // Call only after leaving gate. One caller drains; concurrent/reentrant changes queue behind it.
-    private void PublishRunNeededChanges()
+    private void PublishFactChanges()
     {
         lock (gate)
         {
-            if (publishingRunNeeded || runNeededChanges.Count == 0) return;
-            publishingRunNeeded = true;
+            if (publishingFacts || factChanges.Count == 0) return;
+            publishingFacts = true;
         }
         while (true)
         {
-            bool needed;
+            (bool? RunNeeded, IReadOnlyList<string>? Kinds) change;
             lock (gate)
             {
-                if (!runNeededChanges.TryDequeue(out needed))
+                if (!factChanges.TryDequeue(out change))
                 {
-                    publishingRunNeeded = false;
+                    publishingFacts = false;
                     return;
                 }
             }
-            if (SoftwareCurveRunNeededChanged is not { } observers) continue;
-            foreach (Action<bool> observer in observers.GetInvocationList())
+            if (change.RunNeeded is { } needed)
+                Publish(SoftwareCurveRunNeededChanged, needed, "run-needed");
+            if (change.Kinds is { } kinds)
+                Publish(SoftwareCurveTemperatureKindsChanged, kinds, "temperature-kinds");
+        }
+    }
+
+    private void Publish<T>(Action<T>? observers, T value, string fact)
+    {
+        if (observers is null) return;
+        foreach (Action<T> observer in observers.GetInvocationList())
+        {
+            try { observer(value); }
+            catch (Exception error)
             {
-                try { observer(needed); }
-                catch (Exception error)
-                {
-                    // Host observers cannot interrupt hand-back or leave the notification queue stuck.
-                    lock (gate) Report("run-needed-observer", $"Software curve run-needed callback failed: {error.Message}");
-                }
+                // Host observers cannot interrupt hand-back or leave the notification queue stuck.
+                lock (gate) Report($"{fact}-observer", $"Software curve {fact} callback failed: {error.Message}");
             }
         }
     }
@@ -243,13 +261,6 @@ public sealed class SoftwareCurveEngine : IDisposable
             return false;
         }
 
-        if (plan.Sources.Any(source => source.Required
-            && (source.ReadCelsius() is not { } value || !double.IsFinite(value))))
-        {
-            failureReason = "还没有收到这个风扇要看的温度，软件曲线跑不起来。";
-            return false;
-        }
-
         lock (gate)
         {
             ObjectDisposedException.ThrowIf(disposed, this);
@@ -261,9 +272,9 @@ public sealed class SoftwareCurveEngine : IDisposable
             plans[plan.FanIndex] = plan with { Curve = plan.Curve.ToArray(), Sources = plan.Sources.ToArray() };
             if (existing is not null) existing.Plan = plans[plan.FanIndex];
             if (changed.CurrentCount == 0) changed.Release();
-            UpdateRunNeeded();
+            UpdateFacts();
         }
-        PublishRunNeededChanges();
+        PublishFactChanges();
         failureReason = null;
         return true;
     }
@@ -278,7 +289,7 @@ public sealed class SoftwareCurveEngine : IDisposable
     {
         bool restored;
         lock (gate) restored = TryStopHeld(fanIndex, out failureReason);
-        PublishRunNeededChanges();
+        PublishFactChanges();
         return restored;
     }
 
@@ -292,7 +303,7 @@ public sealed class SoftwareCurveEngine : IDisposable
             fan.Restoring = true;
             restored = TryReleaseHeld(fanIndex, out failureReason);
         }
-        UpdateRunNeeded();
+        UpdateFacts();
         return restored;
     }
 
@@ -307,7 +318,7 @@ public sealed class SoftwareCurveEngine : IDisposable
                 return false;
             }
             running.Remove(fanIndex);
-            UpdateRunNeeded();
+            UpdateFacts();
             return true;
         }
         catch (Exception error)
@@ -397,7 +408,7 @@ public sealed class SoftwareCurveEngine : IDisposable
                         }
                         idleAfterTick = plans.Count == 0 && running.Count == 0;
                     }
-                    PublishRunNeededChanges();
+                    PublishFactChanges();
                     if (idleAfterTick) break;
                 }
             }
@@ -419,7 +430,7 @@ public sealed class SoftwareCurveEngine : IDisposable
                     TryReleaseHeld(fan.Plan.FanIndex, out _);
                 }
             }
-            PublishRunNeededChanges();
+            PublishFactChanges();
         }
     }
 

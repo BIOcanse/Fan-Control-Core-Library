@@ -10,7 +10,7 @@ internal static class RunEntryReviewTests
     private static void Until(Func<bool> ready, string message) => Check(SpinWait.SpinUntil(ready, 3000), message);
     private static void Record(FanCore core)
     {
-        core.Temperatures.Push(new Dictionary<string, double> { ["cpu"] = 60 });
+        core.PushTemperatures([new("cpu", 60, DateTime.UtcNow.Ticks)]);
         Check(core.TryWriteCurve(0, [new(60, 35)], "software", out _), "record plan");
     }
     private static JsonElement Send(FanControlSession session, string request)

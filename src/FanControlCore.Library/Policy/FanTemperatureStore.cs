@@ -23,27 +23,21 @@ public sealed class FanTemperatureStore
     public static readonly TimeSpan MaximumAge = TimeSpan.FromSeconds(3);
 
     private readonly object gate = new();
-    private readonly Dictionary<string, double> values = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, DateTime> observedAt = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, FanTemperatureSample> values = new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>宿主推来一批温度。整批原子替换，不做增量合并。</summary>
-    public void Push(IReadOnlyDictionary<string, double> samples, IReadOnlyDictionary<string, long>? observedAtUtcTicks = null)
+    /// <summary>宿主推来一批温度。整批原子替换，不做增量合并；无效的样本丢掉。</summary>
+    public void Push(IReadOnlyList<FanTemperatureSample> samples)
     {
         ArgumentNullException.ThrowIfNull(samples);
         lock (gate)
         {
             values.Clear();
-            observedAt.Clear();
-            foreach (var (name, celsius) in samples)
+            var now = DateTime.UtcNow.Ticks;
+            foreach (var sample in samples)
             {
-                if (double.IsFinite(celsius))
-                {
-                    var ticks = observedAtUtcTicks is null ? DateTime.UtcNow.Ticks
-                        : observedAtUtcTicks.TryGetValue(name, out var stamp) ? stamp : 0;
-                    if (ticks <= 0 || ticks > DateTime.UtcNow.Ticks) continue;
-                    values[name] = celsius;
-                    observedAt[name] = new DateTime(ticks, DateTimeKind.Utc);
-                }
+                if (!double.IsFinite(sample.Celsius) || sample.ObservedAtUtcTicks <= 0
+                    || sample.ObservedAtUtcTicks > now) continue;
+                values[sample.Name] = sample;
             }
         }
     }
@@ -58,13 +52,35 @@ public sealed class FanTemperatureStore
     {
         lock (gate)
         {
-            if (!observedAt.TryGetValue(name, out var stamp) || DateTime.UtcNow - stamp > MaximumAge)
-            {
-                return null;
-            }
-            return values.TryGetValue(name, out var value) ? value : null;
+            return values.TryGetValue(name, out var sample) && IsFreshAt(sample, DateTime.UtcNow.Ticks)
+                ? sample.Celsius : null;
         }
     }
+
+    // Read a whole kind under the same store gate, including the CPU requirement for "any".
+    internal double? ReadKind(string kind)
+    {
+        lock (gate)
+        {
+            var now = DateTime.UtcNow.Ticks;
+            double? hottest = null;
+            var hasCpu = false;
+            foreach (var sample in values.Values)
+            {
+                if (!IsFreshAt(sample, now)) continue;
+                var cpu = sample.Name.StartsWith(FanTemperatureKinds.Cpu, StringComparison.OrdinalIgnoreCase);
+                hasCpu |= cpu;
+                if (kind == FanTemperatureKinds.Cpu && !cpu) continue;
+                if (kind == FanTemperatureKinds.Gpu
+                    && !sample.Name.StartsWith(FanTemperatureKinds.Gpu, StringComparison.OrdinalIgnoreCase)) continue;
+                hottest = hottest is { } current ? Math.Max(current, sample.Celsius) : sample.Celsius;
+            }
+            return kind == FanTemperatureKinds.Any && !hasCpu ? null : hottest;
+        }
+    }
+
+    private static bool IsFreshAt(FanTemperatureSample sample, long now)
+        => now - sample.ObservedAtUtcTicks <= MaximumAge.Ticks;
 
     /// <summary>现在还有没有新鲜的温度。</summary>
     public bool IsFresh
@@ -73,7 +89,8 @@ public sealed class FanTemperatureStore
         {
             lock (gate)
             {
-                return observedAt.Values.Any(stamp => DateTime.UtcNow - stamp <= MaximumAge);
+                var now = DateTime.UtcNow.Ticks;
+                return values.Values.Any(sample => IsFreshAt(sample, now));
             }
         }
     }
@@ -85,7 +102,8 @@ public sealed class FanTemperatureStore
         {
             lock (gate)
             {
-                return [.. values.Keys.Where(name => DateTime.UtcNow - observedAt[name] <= MaximumAge)];
+                var now = DateTime.UtcNow.Ticks;
+                return [.. values.Values.Where(sample => IsFreshAt(sample, now)).Select(sample => sample.Name)];
             }
         }
     }
