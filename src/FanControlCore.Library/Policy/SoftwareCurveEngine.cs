@@ -85,21 +85,70 @@ public sealed class SoftwareCurveEngine : IDisposable
     /// </summary>
     private static readonly TimeSpan BlindTimeout = TimeSpan.FromSeconds(5);
 
-    private readonly IFanBackend backend;
+    private readonly Func<IFanBackend> resolveBackend;
+    private IFanBackend Backend => resolveBackend();
     private readonly TimeSpan interval;
     private readonly TimeSpan reassertAfter;
     private readonly object gate = new();
+    private readonly Dictionary<int, SoftwareCurvePlan> plans = [];
     private readonly Dictionary<int, FanRuntime> running = [];
+    private readonly SemaphoreSlim changed = new(0, 1);
     private CancellationTokenSource? cancellation;
     private Task? loop;
     private bool disposed;
-    private string? loopFailure;
+    internal Func<int, string?>? PrepareTakeover { get; set; }
     private readonly Dictionary<string, string> diagnostics = [];
     public IReadOnlyList<string> Diagnostics { get { lock (gate) return diagnostics.Values.ToArray(); } }
     public Action<string>? DiagnosticSink { get; set; }
     private string? inFlightOperation;
     public string? InFlightOperation => Volatile.Read(ref inFlightOperation);
     internal Action? BeforeIteration { get; set; }
+    private bool runNeeded;
+    private bool publishingRunNeeded;
+    private readonly Queue<bool> runNeededChanges = new();
+    public bool SoftwareCurveRunNeeded { get { lock (gate) return runNeeded; } }
+    public event Action<bool>? SoftwareCurveRunNeededChanged;
+
+    // Called under gate after plan/runtime changes. Queue every transition in mutation order.
+    private void UpdateRunNeeded()
+    {
+        var needed = plans.Count > 0 || running.Count > 0;
+        if (needed == runNeeded) return;
+        runNeeded = needed;
+        runNeededChanges.Enqueue(needed);
+    }
+
+    // Call only after leaving gate. One caller drains; concurrent/reentrant changes queue behind it.
+    private void PublishRunNeededChanges()
+    {
+        lock (gate)
+        {
+            if (publishingRunNeeded || runNeededChanges.Count == 0) return;
+            publishingRunNeeded = true;
+        }
+        while (true)
+        {
+            bool needed;
+            lock (gate)
+            {
+                if (!runNeededChanges.TryDequeue(out needed))
+                {
+                    publishingRunNeeded = false;
+                    return;
+                }
+            }
+            if (SoftwareCurveRunNeededChanged is not { } observers) continue;
+            foreach (Action<bool> observer in observers.GetInvocationList())
+            {
+                try { observer(needed); }
+                catch (Exception error)
+                {
+                    // Host observers cannot interrupt hand-back or leave the notification queue stuck.
+                    lock (gate) Report("run-needed-observer", $"Software curve run-needed callback failed: {error.Message}");
+                }
+            }
+        }
+    }
 
     private void Report(string key, string detail)
     {
@@ -121,8 +170,18 @@ public sealed class SoftwareCurveEngine : IDisposable
         IFanBackend backend,
         TimeSpan? interval = null,
         TimeSpan? reassertAfter = null)
+        : this(() => backend, interval, reassertAfter)
     {
-        this.backend = backend ?? throw new ArgumentNullException(nameof(backend));
+        ArgumentNullException.ThrowIfNull(backend);
+    }
+
+    // FanCore may run while discovery is unavailable. No plan can be recorded until Open succeeds.
+    internal SoftwareCurveEngine(
+        Func<IFanBackend> resolveBackend,
+        TimeSpan? interval = null,
+        TimeSpan? reassertAfter = null)
+    {
+        this.resolveBackend = resolveBackend;
         /*
          * 0.1 秒一轮。
          *
@@ -144,24 +203,33 @@ public sealed class SoftwareCurveEngine : IDisposable
     {
         lock (gate)
         {
-            return running.ContainsKey(fanIndex);
+            return loop is { IsCompleted: false } && plans.ContainsKey(fanIndex)
+                && (!running.TryGetValue(fanIndex, out var fan) || !fan.Restoring);
         }
     }
 
-    public IReadOnlyList<FanCurvePoint>? ActiveCurve(int fanIndex)
+    public bool HasPlan(int fanIndex)
     {
-        lock (gate)
-            return running.TryGetValue(fanIndex, out var fan) && !fan.Restoring
-                ? fan.Plan.Curve.ToArray() : null;
+        lock (gate) return plans.ContainsKey(fanIndex);
+    }
+
+    internal bool HasRuntime(int fanIndex)
+    {
+        lock (gate) return running.ContainsKey(fanIndex);
+    }
+
+    public IReadOnlyList<FanCurvePoint>? RecordedCurve(int fanIndex)
+    {
+        lock (gate) return plans.TryGetValue(fanIndex, out var plan) ? plan.Curve.ToArray() : null;
     }
 
     /// <summary>
-    /// 给这把风扇挂一条软件曲线。已经有的就换掉。
+    /// 记录这把风扇的软件曲线，已经有的就换掉；不启动执行。
     ///
     /// 换曲线**不重置当前转速**：风扇此刻转到哪儿是物理事实，和换不换曲线无关。
     /// 重置的话，换完那一下会从头按加速度爬，白白慢一截。
     /// </summary>
-    public bool TryStart(SoftwareCurvePlan plan, out string? failureReason)
+    public bool TryRecordPlan(SoftwareCurvePlan plan, out string? failureReason)
     {
         ArgumentNullException.ThrowIfNull(plan);
         if (plan.Curve.Count == 0)
@@ -185,27 +253,17 @@ public sealed class SoftwareCurveEngine : IDisposable
         lock (gate)
         {
             ObjectDisposedException.ThrowIf(disposed, this);
-            if (loopFailure is not null && running.Count > 0)
+            if (running.TryGetValue(plan.FanIndex, out var existing) && existing.Restoring)
             {
-                failureReason = $"Software curve loop failed; firmware restoration is pending: {loopFailure}";
+                failureReason = "风扇仍在交还固件，请等待恢复完成。";
                 return false;
             }
-            loopFailure = null;
-            if (running.TryGetValue(plan.FanIndex, out var existing))
-            {
-                if (existing.Restoring)
-                {
-                    failureReason = "风扇仍在交还固件，请等待恢复完成。";
-                    return false;
-                }
-                existing.Plan = plan;
-            }
-            else
-            {
-                running[plan.FanIndex] = new FanRuntime(plan);
-            }
-            EnsureLoop();
+            plans[plan.FanIndex] = plan with { Curve = plan.Curve.ToArray(), Sources = plan.Sources.ToArray() };
+            if (existing is not null) existing.Plan = plans[plan.FanIndex];
+            if (changed.CurrentCount == 0) changed.Release();
+            UpdateRunNeeded();
         }
+        PublishRunNeededChanges();
         failureReason = null;
         return true;
     }
@@ -218,28 +276,47 @@ public sealed class SoftwareCurveEngine : IDisposable
     /// </summary>
     public bool TryStop(int fanIndex, out string? failureReason)
     {
-        lock (gate)
+        bool restored;
+        lock (gate) restored = TryStopHeld(fanIndex, out failureReason);
+        PublishRunNeededChanges();
+        return restored;
+    }
+
+    private bool TryStopHeld(int fanIndex, out string? failureReason)
+    {
+        plans.Remove(fanIndex);
+        failureReason = null;
+        var restored = true;
+        if (running.TryGetValue(fanIndex, out var fan))
         {
-            if (running.TryGetValue(fanIndex, out var fan)) fan.Restoring = true;
-            inFlightOperation = $"curve release fan {fanIndex}";
-            try
+            fan.Restoring = true;
+            restored = TryReleaseHeld(fanIndex, out failureReason);
+        }
+        UpdateRunNeeded();
+        return restored;
+    }
+
+    private bool TryReleaseHeld(int fanIndex, out string? failureReason)
+    {
+        inFlightOperation = $"curve release fan {fanIndex}";
+        try
+        {
+            if (!Backend.TryReleaseOverride(fanIndex, out failureReason))
             {
-                if (!backend.TryReleaseOverride(fanIndex, out failureReason))
-                {
-                    Report($"release:{fanIndex}", $"Fan {fanIndex} release failed; restoration pending: {failureReason ?? "not confirmed"}");
-                    return false;
-                }
-                running.Remove(fanIndex);
-                return true;
-            }
-            catch (Exception error)
-            {
-                failureReason = error.Message;
-                Report($"release:{fanIndex}", $"Fan {fanIndex} release failed; restoration pending: {error.Message}");
+                Report($"release:{fanIndex}", $"Fan {fanIndex} release failed; restoration pending: {failureReason ?? "not confirmed"}");
                 return false;
             }
-            finally { inFlightOperation = null; }
+            running.Remove(fanIndex);
+            UpdateRunNeeded();
+            return true;
         }
+        catch (Exception error)
+        {
+            failureReason = error.Message;
+            Report($"release:{fanIndex}", $"Fan {fanIndex} release failed; restoration pending: {error.Message}");
+            return false;
+        }
+        finally { inFlightOperation = null; }
     }
 
     /// <summary>
@@ -253,7 +330,7 @@ public sealed class SoftwareCurveEngine : IDisposable
         int[] indexes;
         lock (gate)
         {
-            indexes = [.. running.Keys];
+            indexes = [.. plans.Keys.Union(running.Keys)];
         }
         foreach (var index in indexes)
         {
@@ -261,38 +338,50 @@ public sealed class SoftwareCurveEngine : IDisposable
         }
     }
 
-    private void EnsureLoop()
+    /// <summary>Execute recorded plans until the host cancels. Starts no background task.</summary>
+    public Task RunAsync(CancellationToken stop)
     {
-        if (loop is { IsCompleted: false })
+        lock (gate)
         {
-            return;
+            ObjectDisposedException.ThrowIf(disposed, this);
+            if (loop is { IsCompleted: false })
+                throw new InvalidOperationException("A software curve run is already active.");
+            cancellation?.Dispose();
+            cancellation = CancellationTokenSource.CreateLinkedTokenSource(stop);
+            loop = RunLoopAsync(cancellation.Token);
+            return loop;
         }
-        cancellation?.Dispose();
-        cancellation = new CancellationTokenSource();
-        loop = Task.Run(() => RunAsync(cancellation.Token));
     }
 
-    private async Task RunAsync(CancellationToken cancellationToken)
+    private async Task RunLoopAsync(CancellationToken stop)
     {
-        // Keep the existing timer. Body faults change this loop to release-only.
-        // Timer faults get a final release pass and an explicit faulted state.
+        // Assign the task before it can complete or access hardware.
+        await Task.CompletedTask.ConfigureAwait(ConfigureAwaitOptions.ForceYielding);
         try
         {
-            using var timer = new PeriodicTimer(interval);
-            while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
+            while (true)
             {
-                try
+                bool idle;
+                lock (gate) idle = plans.Count == 0 && running.Count == 0;
+                if (idle)
                 {
-                    BeforeIteration?.Invoke();
-                    FanRuntime[] snapshot;
-                    lock (gate) snapshot = [.. running.Values];
-                    foreach (var fan in snapshot)
+                    await changed.WaitAsync(stop).ConfigureAwait(false);
+                    continue;
+                }
+                using var timer = new PeriodicTimer(interval);
+                while (await timer.WaitForNextTickAsync(stop).ConfigureAwait(false))
+                {
+                    bool idleAfterTick;
+                    lock (gate)
                     {
-                        lock (gate)
+                        stop.ThrowIfCancellationRequested();
+                        BeforeIteration?.Invoke();
+                        foreach (var plan in plans.Values)
+                            if (!running.ContainsKey(plan.FanIndex)) running[plan.FanIndex] = new FanRuntime(plan);
+                        foreach (var fan in running.Values.ToArray())
                         {
                             var index = fan.Plan.FanIndex;
-                            if (!running.TryGetValue(index, out var current) || !ReferenceEquals(current, fan)) continue;
-                            if (fan.Restoring) { TryStop(index, out _); continue; }
+                            if (fan.Restoring) { TryReleaseHeld(index, out _); continue; }
                             try
                             {
                                 inFlightOperation = $"curve tick fan {index}";
@@ -301,30 +390,37 @@ public sealed class SoftwareCurveEngine : IDisposable
                             catch (Exception error)
                             {
                                 Report($"tick:{index}", $"Fan {index} curve tick failed; handing back to firmware: {error.Message}");
-                                TryStop(index, out _);
+                                TryStopHeld(index, out _);
                             }
                             finally { inFlightOperation = null; }
-                            if (fan.Failures >= 5) TryStop(index, out _);
+                            if (fan.Failures >= 5) TryStopHeld(index, out _);
                         }
+                        idleAfterTick = plans.Count == 0 && running.Count == 0;
                     }
+                    PublishRunNeededChanges();
+                    if (idleAfterTick) break;
                 }
-                catch (Exception error) { FailLoop(error); }
             }
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
-        catch (Exception error) { FailLoop(error); }
-        finally { StopAll(); }
-    }
-
-    private void FailLoop(Exception error)
-    {
-        lock (gate)
+        catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
+        catch (Exception error)
         {
-            loopFailure = error.Message;
-            foreach (var fan in running.Values) fan.Restoring = true;
-            Report("loop", $"Software curve loop failed; all fans are being handed back to firmware: {error.Message}");
+            lock (gate) Report("loop", $"Software curve loop failed; all fans are being handed back to firmware: {error.Message}");
+            throw;
         }
-        StopAll();
+        finally
+        {
+            lock (gate)
+            {
+                // Retain plans; a later run starts from its target after firmware hand-back.
+                foreach (var fan in running.Values.ToArray())
+                {
+                    fan.Restoring = true;
+                    TryReleaseHeld(fan.Plan.FanIndex, out _);
+                }
+            }
+            PublishRunNeededChanges();
+        }
     }
 
     private void Tick(FanRuntime fan)
@@ -344,7 +440,7 @@ public sealed class SoftwareCurveEngine : IDisposable
             fan.BlindSince ??= DateTime.UtcNow;
             if (DateTime.UtcNow - fan.BlindSince.Value >= BlindTimeout)
             {
-                TryStop(plan.FanIndex, out _);
+                TryStopHeld(plan.FanIndex, out _);
             }
             return;
         }
@@ -414,7 +510,13 @@ public sealed class SoftwareCurveEngine : IDisposable
         }
 
         // 用执行器那条路，不是"设固定转速"那条 —— 见 IFanBackend.TryDriveDuty。
-        if (backend.TryDriveDuty(fan.Plan.FanIndex, wanted, out _))
+        if (!fan.TakeoverPrepared)
+        {
+            if (PrepareTakeover?.Invoke(fan.Plan.FanIndex) is { } failure)
+                throw new InvalidOperationException(failure);
+            fan.TakeoverPrepared = true;
+        }
+        if (Backend.TryDriveDuty(fan.Plan.FanIndex, wanted, out _))
         {
             fan.Applied = wanted;
             fan.LastWrite = DateTime.UtcNow;
@@ -428,7 +530,7 @@ public sealed class SoftwareCurveEngine : IDisposable
 
     private FanDescription? DescriptionOf(int fanIndex)
     {
-        foreach (var description in backend.Describe())
+        foreach (var description in Backend.Describe())
         {
             if (description.Index == fanIndex)
             {
@@ -506,21 +608,17 @@ public sealed class SoftwareCurveEngine : IDisposable
 
     public void Dispose()
     {
-        if (disposed)
+        Task? run;
+        lock (gate)
         {
-            return;
+            if (disposed) return;
+            disposed = true;
+            cancellation?.Cancel();
+            run = loop;
         }
-        disposed = true;
-        cancellation?.Cancel();
-        // 先停循环再交还：反过来的话，循环可能在交还之后又写回一个手动值。
-        try
-        {
-            loop?.Wait(TimeSpan.FromSeconds(3));
-        }
-        catch (AggregateException)
-        {
-            // 循环自己怎么结束的不重要，交还才重要。
-        }
+        // Do not dispose a backend until its run has finished releasing it.
+        try { run?.GetAwaiter().GetResult(); }
+        catch (Exception) { /* The run caller observes faults; cleanup still proceeds. */ }
         StopAll();
         cancellation?.Dispose();
     }
@@ -533,6 +631,7 @@ public sealed class SoftwareCurveEngine : IDisposable
         public DateTime LastWrite { get; set; } = DateTime.MinValue;
         public int Failures { get; set; }
         public bool Restoring { get; set; }
+        public bool TakeoverPrepared { get; set; }
         /// <summary>从什么时候开始一直读不到温度。null 表示现在读得到。</summary>
         public DateTime? BlindSince { get; set; }
     }

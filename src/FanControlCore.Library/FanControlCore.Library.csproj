@@ -5,7 +5,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>FanControlCore.Library</AssemblyName>
     <RootNamespace>FanControlCore</RootNamespace>
-    <Version>0.1.0-dev.4</Version>
+    <Version>0.1.0-dev.5</Version>
     <PackageId>FanControlCore.Library</PackageId>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
     <Authors>BIOcanse</Authors>

@@ -72,15 +72,20 @@ public sealed class AsusWmiFanBackend : IFanBackend
 
     public string Name => "asus-atk-wmi";
 
-    public bool TryOpen(out string? unavailableReason)
+    public bool TryOpen(out string? unavailableReason) => TryOpen(out _, out unavailableReason);
+
+    public bool TryOpen(out FanOpenFailureKind failureKind, out string? unavailableReason)
     {
+        failureKind = FanOpenFailureKind.Other;
         if (!OperatingSystem.IsWindows())
         {
+            failureKind = FanOpenFailureKind.NoSupportedController;
             unavailableReason = "这条通道只有 Windows 上有。";
             return false;
         }
         if (!wmi.IsAvailable)
         {
+            failureKind = wmi.AvailabilityFailureKind;
             unavailableReason = "这台机器上没有 ASUS 的 ATK WMI 接口，或者没有管理员权限。";
             return false;
         }

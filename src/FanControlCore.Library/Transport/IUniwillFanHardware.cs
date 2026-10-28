@@ -3,6 +3,7 @@ namespace FanControlCore.Transport;
 internal interface IUniwillFanHardware : IDisposable
 {
     bool IsAvailable { get; }
+    FanOpenFailureKind AvailabilityFailureKind => FanOpenFailureKind.Other;
     string? Diagnostic => null;
     byte? Read(ushort address);
     int? ReadBigEndianWord(ushort highAddress, ushort lowAddress);

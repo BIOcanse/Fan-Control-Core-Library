@@ -124,22 +124,29 @@ public sealed partial class LenovoWmiFanBackend : IFanBackend
 
     public string Name => "lenovo-legion-wmi";
 
-    public bool TryOpen(out string? unavailableReason)
+    public bool TryOpen(out string? unavailableReason) => TryOpen(out _, out unavailableReason);
+
+    public bool TryOpen(out FanOpenFailureKind failureKind, out string? unavailableReason)
     {
+        failureKind = FanOpenFailureKind.Other;
         if (!OperatingSystem.IsWindows())
         {
+            failureKind = FanOpenFailureKind.NoSupportedController;
             unavailableReason = "这条通道只有 Windows 上有。";
             return false;
         }
         if (!hardware.IsAvailable)
         {
+            failureKind = hardware.AvailabilityFailureKind;
             unavailableReason = "这台机器上没有联想的 Legion WMI 接口，或者没有管理员权限。";
             return false;
         }
         // 固件自己说支不支持强冷。它说不支持就别去写 —— 这是它的接口，它说了算。
-        if (hardware.ReadCoolingSupported() is not { } supported
-            || supported == 0)
+        var supported = hardware.ReadCoolingSupported();
+        if (supported is null || supported == 0)
         {
+            // A missing response is unknown; an explicit zero declares no supported controller.
+            failureKind = supported == 0 ? FanOpenFailureKind.NoSupportedController : FanOpenFailureKind.Other;
             unavailableReason = "联想的 WMI 接口在，但这台机器上没有风扇强冷这一项。";
             return false;
         }

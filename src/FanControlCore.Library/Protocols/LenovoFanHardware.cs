@@ -6,6 +6,7 @@ namespace FanControlCore.Protocols;
 internal interface ILenovoFanHardware : IDisposable
 {
     bool IsAvailable { get; }
+    FanOpenFailureKind AvailabilityFailureKind => FanOpenFailureKind.Other;
     string? Identity { get; }
     ulong? ReadCoolingSupported();
     ulong? ReadCooling();
@@ -23,6 +24,9 @@ internal sealed class LenovoFanHardware : ILenovoFanHardware
     private readonly Lazy<string?> identity = new(FanMachineIdentity.ReadSystemUuid);
 
     public bool IsAvailable => gameZone.IsAvailable && fanMethod.IsAvailable;
+    public FanOpenFailureKind AvailabilityFailureKind
+        => gameZone.AvailabilityFailureKind == FanOpenFailureKind.AccessDenied
+            ? FanOpenFailureKind.AccessDenied : fanMethod.AvailabilityFailureKind;
     public string? Identity => identity.Value;
     public ulong? ReadCoolingSupported() => gameZone.InvokeOrdered("IsSupportFanCooling");
     public ulong? ReadCooling() => gameZone.InvokeOrdered("GetFanCoolingStatus");

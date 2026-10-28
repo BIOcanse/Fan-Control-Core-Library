@@ -51,10 +51,14 @@ public sealed class DesktopSuperIoFanBackend : IFanBackend
             ? channels[fanIndex].Control.GetType().GetProperty("Identifier")?.GetValue(channels[fanIndex].Control)?.ToString()
             : null;
 
-    public bool TryOpen(out string? unavailableReason)
+    public bool TryOpen(out string? unavailableReason) => TryOpen(out _, out unavailableReason);
+
+    public bool TryOpen(out FanOpenFailureKind failureKind, out string? unavailableReason)
     {
+        failureKind = FanOpenFailureKind.Other;
         if (!OperatingSystem.IsWindows())
         {
+            failureKind = FanOpenFailureKind.NoSupportedController;
             unavailableReason = "这条通道只有 Windows 上有（Linux 上直接走 hwmon）。";
             return false;
         }
@@ -105,6 +109,8 @@ public sealed class DesktopSuperIoFanBackend : IFanBackend
         catch (Exception error) when (error is not OutOfMemoryException)
         {
             Close();
+            var cause = error is TargetInvocationException { InnerException: { } inner } ? inner : error;
+            if (cause is UnauthorizedAccessException) failureKind = FanOpenFailureKind.AccessDenied;
             unavailableReason = $"打不开主板风扇通道：{error.Message}";
             return false;
         }

@@ -45,13 +45,22 @@ public static class FanCommandServer
 
     public static Dictionary<string, object?> Handle(FanCore core, string line)
     {
+        var reply = HandleRequest(core, line, out var operation);
+        if (operation is "curve" or "setcurve" or "auto" or "set" or "boost")
+            reply["softwareCurveRunNeeded"] = core.SoftwareCurveRunNeeded;
+        return reply;
+    }
+
+    private static Dictionary<string, object?> HandleRequest(FanCore core, string line, out string? operation)
+    {
+        operation = null;
         long id = 0;
         try
         {
             using var document = JsonDocument.Parse(line);
             var request = document.RootElement;
             id = request.TryGetProperty("id", out var idElement) ? idElement.GetInt64() : 0;
-            var operation = request.TryGetProperty("op", out var opElement)
+            operation = request.TryGetProperty("op", out var opElement)
                 ? opElement.GetString()
                 : null;
 
@@ -64,6 +73,8 @@ public static class FanCommandServer
                         ["available"] = core.ActiveBackendName is not null,
                         ["backend"] = core.ActiveBackendName,
                         ["reason"] = core.UnavailableReason,
+                        ["openFailureKind"] = core.OpenFailureKind,
+                        ["openFailures"] = core.OpenFailures,
                         // Normal describe returns detected capabilities. Explicit refresh
                         // runs before serializing all fields, so availability is current too.
                         ["fans"] = fans,
@@ -90,7 +101,7 @@ public static class FanCommandServer
                      * 不是一条会累积的流水。
                      *
                      * 这条 op 不碰硬件，所以它很便宜 —— 0.1 秒一次也无所谓。
-                     * 它也**不会自己触发调速**：调速在引擎自己的循环里，
+                     * 它也**不会自己触发调速**：调速在宿主持有的运行入口里，
                      * 推送只是把最新值放进去。两者分开，推送慢了或者停了，
                      * 引擎有自己的失效处理（读不到超过 5 秒就交还固件）。
                      */
@@ -129,6 +140,7 @@ public static class FanCommandServer
                     {
                         ["fan"] = fan,
                         ["execution"] = core.ExecutionOf(fan),
+                        ["softwarePlanRecorded"] = core.SoftwarePlanRecorded(fan),
                         // 读不到就是 null，调用方看得出来。不给一条编的曲线。
                         ["curve"] = core.ReadCurve(fan)
                     });
@@ -166,14 +178,14 @@ public static class FanCommandServer
                     {
                         return Error(id, reason ?? "写不了曲线。");
                     }
-                    // 固件回执来自实际表，软件回执来自活跃执行计划，不回显提交值。
+                    // 固件回执来自实际表，软件回执来自已记录的计划，不回显提交值。
                     // 两者对不上正是调用方要知道的事（阈值会被夹、回差会加上去）。
                     return Ok(id, new Dictionary<string, object?>
                     {
                         ["fan"] = fan,
-                        // 实际走的是哪条。用户选了固件而这台机器只有软件时我们会拒绝，
-                        // 所以这里回的一定就是他选的那条 —— 回出来是为了让界面对得上账。
+                        // Report current execution separately from the recorded software plan.
                         ["execution"] = core.ExecutionOf(fan),
+                        ["softwarePlanRecorded"] = core.SoftwarePlanRecorded(fan),
                         ["curve"] = core.ReadCurve(fan)
                     });
                 }

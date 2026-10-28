@@ -17,12 +17,29 @@ internal static class LenovoFirmwareCurveTests
         var directory = Path.Combine(Path.GetTempPath(), "fcc-lenovo-" + Guid.NewGuid().ToString("N"));
         try
         {
+            TestOpenFailures();
             TestPersistentCancellation(directory);
             TestFailures(directory);
             TestMissingAndInvalid(directory);
             TestDetectionRefresh(directory);
         }
         finally { if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true); }
+    }
+
+    private static void TestOpenFailures()
+    {
+        foreach (var supported in new ulong?[] { 0, null })
+        {
+            using var backend = new LenovoWmiFanBackend(new Hardware { CoolingSupport = supported }, null);
+            Check(!backend.TryOpen(out var kind, out _)
+                && kind == (supported == 0 ? FanOpenFailureKind.NoSupportedController : FanOpenFailureKind.Other),
+                "explicit unsupported cooling differs from an unreadable response");
+        }
+        foreach (var kind in new[] { FanOpenFailureKind.AccessDenied, FanOpenFailureKind.DriverMissing })
+        {
+            using var backend = new LenovoWmiFanBackend(new Hardware { Available = false, AvailabilityFailureKind = kind }, null);
+            Check(!backend.TryOpen(out var actual, out _) && actual == kind, "typed transport failure reaches backend");
+        }
     }
 
     private static void TestDetectionRefresh(string directory)
@@ -151,7 +168,10 @@ internal static class LenovoFirmwareCurveTests
 
     private sealed class Hardware : ILenovoFanHardware
     {
-        public bool IsAvailable => true;
+        public bool Available = true;
+        public bool IsAvailable => Available;
+        public FanOpenFailureKind AvailabilityFailureKind { get; init; } = FanOpenFailureKind.Other;
+        public ulong? CoolingSupport = 1;
         public string? Identity { get; init; } = "b0b0f66a-13ce-4ef0-868f-e145cd703cef";
         public bool Cooling, FailCooling, IgnoreWrites, RejectTable;
         public int TableWrites;
@@ -163,7 +183,7 @@ internal static class LenovoFirmwareCurveTests
             for (var point = 0; point < 10; point++) table[6 + point * 2] = 0;
             return table;
         }
-        public ulong? ReadCoolingSupported() => 1;
+        public ulong? ReadCoolingSupported() => CoolingSupport;
         public ulong? ReadCooling() => Cooling ? 1ul : 0ul;
         public bool SetCooling(bool enabled) { if (FailCooling) return false; Cooling = enabled; return true; }
         public ulong? ReadRpm(uint fanId) => Tables.ContainsKey(fanId) ? 2000ul : null;

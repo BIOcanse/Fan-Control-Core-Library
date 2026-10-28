@@ -68,6 +68,7 @@ public sealed class WmiMethodChannel : IDisposable
 
     /// <summary>这台机器上有没有这个类的实例。没有就是没有这条通道。</summary>
     public bool IsAvailable => Resolve() is not null;
+    public FanOpenFailureKind AvailabilityFailureKind { get; private set; } = FanOpenFailureKind.Other;
 
     /// <summary>
     /// 调一次方法。
@@ -521,6 +522,7 @@ public sealed class WmiMethodChannel : IDisposable
                 return device;
             }
             probed = true;
+            AvailabilityFailureKind = FanOpenFailureKind.Other;
             resolvedClassName = declaredClassName ?? FindClassByGuid();
             if (resolvedClassName is null)
             {
@@ -542,7 +544,9 @@ public sealed class WmiMethodChannel : IDisposable
             catch (Exception error) when (error is ManagementException
                 or UnauthorizedAccessException)
             {
-                // 没有这条通道，或者没有管理员权限。两者都归"用不了"。
+                AvailabilityFailureKind = error is UnauthorizedAccessException
+                    or ManagementException { ErrorCode: ManagementStatus.AccessDenied }
+                    ? FanOpenFailureKind.AccessDenied : FanOpenFailureKind.Other;
             }
             return device;
         }
@@ -565,15 +569,17 @@ public sealed class WmiMethodChannel : IDisposable
     /// 找不到就是这台机器上没有这个厂商接口。
     /// </summary>
     private string? FindClassByGuid()
-        => classGuid is not null
-            && GuidMapOf(scope).TryGetValue(classGuid, out var found)
-                ? found
-                : null;
+    {
+        var map = GuidMapOf(scope, out var failureKind);
+        AvailabilityFailureKind = failureKind;
+        return classGuid is not null && map.TryGetValue(classGuid, out var found) ? found : null;
+    }
 
-    private static IReadOnlyDictionary<string, string> GuidMapOf(string scope)
+    private static IReadOnlyDictionary<string, string> GuidMapOf(string scope, out FanOpenFailureKind failureKind)
     {
         lock (GuidMapGate)
         {
+            failureKind = FanOpenFailureKind.Other;
             if (GuidMaps.TryGetValue(scope, out var cached))
             {
                 return cached;
@@ -604,7 +610,11 @@ public sealed class WmiMethodChannel : IDisposable
             catch (Exception error) when (error is ManagementException
                 or UnauthorizedAccessException)
             {
-                // 列不了类：没有权限，或者这个 scope 根本不在。空表就是"一个都没找到"。
+                failureKind = error is UnauthorizedAccessException
+                    or ManagementException { ErrorCode: ManagementStatus.AccessDenied }
+                    ? FanOpenFailureKind.AccessDenied : FanOpenFailureKind.Other;
+                // Failed discovery is not a successful empty map: a later session may retry.
+                return map;
             }
             GuidMaps[scope] = map;
             return map;

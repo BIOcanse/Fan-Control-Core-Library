@@ -22,7 +22,18 @@ public sealed class FanControlSession : IDisposable
     public JsonElement Handle(JsonElement request)
         => JsonSerializer.SerializeToElement(FanCommandServer.Handle(core, request.GetRawText()), Json);
 
+    /// <summary>Execute recorded software plans until the host cancels; concurrent runs are rejected.</summary>
+    public Task RunSoftwareCurveAsync(CancellationToken stop) => core.RunSoftwareCurveAsync(stop);
+    public bool SoftwareCurveRunNeeded => core.SoftwareCurveRunNeeded;
+    public event Action<bool>? SoftwareCurveRunNeededChanged
+    {
+        add => core.SoftwareCurveRunNeededChanged += value;
+        remove => core.SoftwareCurveRunNeededChanged -= value;
+    }
+
     public void SetDiagnosticSink(Action<string> sink) => core.DiagnosticSink = sink;
+    public FanOpenFailureKind? OpenFailureKind => core.OpenFailureKind;
+    public IReadOnlyList<FanOpenFailure> OpenFailures => core.OpenFailures;
     public string? InFlightOperation => core.InFlightOperation;
     public void Dispose() => core.Dispose();
 }

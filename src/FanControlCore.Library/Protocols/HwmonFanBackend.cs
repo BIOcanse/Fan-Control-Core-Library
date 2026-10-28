@@ -30,11 +30,15 @@ public sealed class HwmonFanBackend : IFanBackend
         return Path.Combine(physical, Path.GetFileName(duty));
     }
 
-    public bool TryOpen(out string? unavailableReason)
+    public bool TryOpen(out string? unavailableReason) => TryOpen(out _, out unavailableReason);
+
+    public bool TryOpen(out FanOpenFailureKind failureKind, out string? unavailableReason)
     {
+        failureKind = FanOpenFailureKind.Other;
         fans.Clear();
         if (!OperatingSystem.IsLinux())
         {
+            failureKind = FanOpenFailureKind.NoSupportedController;
             unavailableReason = "hwmon 只有 Linux 上有。";
             return false;
         }

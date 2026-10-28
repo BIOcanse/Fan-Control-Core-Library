@@ -202,6 +202,13 @@ public interface IFanBackend : IDisposable
     /// </summary>
     bool TryOpen(out string? unavailableReason);
 
+    /// <summary>Typed attempt. Existing integrations without typed evidence report Other.</summary>
+    bool TryOpen(out FanOpenFailureKind failureKind, out string? unavailableReason)
+    {
+        failureKind = FanOpenFailureKind.Other;
+        return TryOpen(out unavailableReason);
+    }
+
     /// <summary>用户显式重新检测时重新读取通道能力，不改设定和所有权。</summary>
     void RefreshDetection() { }
 

@@ -48,15 +48,20 @@ public sealed partial class UniwillWmiFanBackend : IFanBackend
     public string Name => "uniwill-wmi-ec";
     public IReadOnlyList<string> Diagnostics => transport.Diagnostic is { } detail ? [detail] : [];
 
-    public bool TryOpen(out string? unavailableReason)
+    public bool TryOpen(out string? unavailableReason) => TryOpen(out _, out unavailableReason);
+
+    public bool TryOpen(out FanOpenFailureKind failureKind, out string? unavailableReason)
     {
+        failureKind = FanOpenFailureKind.Other;
         if (!OperatingSystem.IsWindows())
         {
+            failureKind = FanOpenFailureKind.NoSupportedController;
             unavailableReason = "这条通道只有 Windows 上有。";
             return false;
         }
         if (!transport.IsAvailable)
         {
+            failureKind = transport.AvailabilityFailureKind;
             unavailableReason = "这台机器上没有 Uniwill 的 ACPI WMI 接口，或者没有管理员权限。";
             return false;
         }

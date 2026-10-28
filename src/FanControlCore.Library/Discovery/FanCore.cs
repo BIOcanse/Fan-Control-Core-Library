@@ -52,9 +52,15 @@ public sealed class FanCore : IDisposable
 
     /// <summary>Explicit backend selection for embedding and isolated testing.</summary>
     public FanCore(IFanBackend backend, FanCoreOptions? options = null)
+        : this(new[] { backend ?? throw new ArgumentNullException(nameof(backend)) }, options) { }
+
+    /// <summary>Explicit ordered candidates for embedding and isolated discovery tests.</summary>
+    public FanCore(IEnumerable<IFanBackend> backends, FanCoreOptions? options = null)
     {
         journal = string.IsNullOrWhiteSpace(options?.StateDirectory) ? null : new(options);
-        candidates.Add(backend ?? throw new ArgumentNullException(nameof(backend)));
+        ArgumentNullException.ThrowIfNull(backends);
+        foreach (var backend in backends)
+            candidates.Add(backend ?? throw new ArgumentException("A backend candidate cannot be null.", nameof(backends)));
     }
 
     /// <summary>选中的通道叫什么。还没选中就是 null。</summary>
@@ -62,6 +68,8 @@ public sealed class FanCore : IDisposable
 
     /// <summary>没选中任何通道时，为什么。</summary>
     public string? UnavailableReason => unavailableReason;
+    public FanOpenFailureKind? OpenFailureKind { get; private set; }
+    public IReadOnlyList<FanOpenFailure> OpenFailures { get; private set; } = [];
 
     /// <summary>
     /// **二级路由**：在一级路由排好的候选里，逐条问它的识别依据命中没有。
@@ -77,22 +85,41 @@ public sealed class FanCore : IDisposable
             return true;
         }
 
-        var reasons = new List<string>();
+        var failures = new List<FanOpenFailure>();
         foreach (var candidate in candidates)
         {
-            if (candidate.TryOpen(out var reason))
+            bool opened;
+            FanOpenFailureKind kind;
+            string? reason;
+            try { opened = candidate.TryOpen(out kind, out reason); }
+            catch (Exception error)
+            {
+                opened = false;
+                kind = FanOpenFailureKind.Other;
+                reason = error.Message;
+            }
+            if (opened)
             {
                 active = candidate;
+                GetEngine();
                 unavailableReason = null;
+                OpenFailureKind = null;
+                OpenFailures = [];
                 EnsureRecovery(out _);
                 return true;
             }
-            reasons.Add($"{candidate.Name}：{reason ?? "不可用"}");
+            if (!Enum.IsDefined(kind)) kind = FanOpenFailureKind.Other;
+            failures.Add(new(candidate.Name, kind, reason ?? "不可用"));
         }
 
-        unavailableReason = reasons.Count == 0
+        OpenFailures = failures.AsReadOnly();
+        OpenFailureKind = failures.Any(failure => failure.Kind == FanOpenFailureKind.Other) ? FanOpenFailureKind.Other
+            : failures.Any(failure => failure.Kind == FanOpenFailureKind.AccessDenied) ? FanOpenFailureKind.AccessDenied
+            : failures.Any(failure => failure.Kind == FanOpenFailureKind.DriverMissing) ? FanOpenFailureKind.DriverMissing
+            : FanOpenFailureKind.NoSupportedController;
+        unavailableReason = failures.Count == 0
             ? "这个平台上还没有可用的风扇通道。"
-            : string.Join("；", reasons);
+            : string.Join("；", failures.Select(failure => $"{failure.Backend}：{failure.Reason}"));
         return false;
     }
 
@@ -110,9 +137,9 @@ public sealed class FanCore : IDisposable
     public IReadOnlyList<FanState> Read()
         => active?.Read() ?? [];
 
-    /// <summary>这个风扇现在跑的曲线。读不到、或者这条通道没有曲线，就是 null。</summary>
+    /// <summary>已记录的软件计划或固件曲线；没有可读曲线时返回 null。</summary>
     public IReadOnlyList<FanCurvePoint>? ReadCurve(int fanIndex)
-        => engine?.ActiveCurve(fanIndex) ?? active?.ReadCurve(fanIndex);
+        => engine?.RecordedCurve(fanIndex) ?? active?.ReadCurve(fanIndex);
 
     public bool TrySetDuty(int fanIndex, double percent, out string? failureReason)
     {
@@ -122,14 +149,14 @@ public sealed class FanCore : IDisposable
             return false;
         }
         if (!PrepareTemporaryTakeover(fanIndex, out failureReason)) return false;
-        if (engine?.IsRunning(fanIndex) == true && !engine.TryStop(fanIndex, out failureReason)) return false;
+        if ((engine?.HasPlan(fanIndex) == true || engine?.HasRuntime(fanIndex) == true) && !engine.TryStop(fanIndex, out failureReason)) return false;
         if (!active.TrySetDuty(fanIndex, percent, out failureReason))
         {
-            if (active.HasPendingTemporaryRestore(fanIndex)) overridden.Add(fanIndex);
+            if (active.HasPendingTemporaryRestore(fanIndex)) { lock (overridden) overridden.Add(fanIndex); }
             return false;
         }
         // 记下来，退出时要交还固件。
-        overridden.Add(fanIndex);
+        lock (overridden) overridden.Add(fanIndex);
         return true;
     }
 
@@ -142,12 +169,12 @@ public sealed class FanCore : IDisposable
             return false;
         }
         if (!PrepareTemporaryTakeover(fanIndex, out failureReason)) return false;
-        if (engine?.IsRunning(fanIndex) == true && !engine.TryStop(fanIndex, out failureReason)) return false;
+        if ((engine?.HasPlan(fanIndex) == true || engine?.HasRuntime(fanIndex) == true) && !engine.TryStop(fanIndex, out failureReason)) return false;
         if (!active.TrySetFullSpeed(fanIndex, out failureReason))
         {
             return false;
         }
-        overridden.Add(fanIndex);
+        lock (overridden) overridden.Add(fanIndex);
         return true;
     }
 
@@ -159,14 +186,14 @@ public sealed class FanCore : IDisposable
             return false;
         }
         if (!EnsureRecovery(out failureReason)) return false;
-        if (engine?.IsRunning(fanIndex) == true && !engine.TryStop(fanIndex, out failureReason)) return false;
+        if ((engine?.HasPlan(fanIndex) == true || engine?.HasRuntime(fanIndex) == true) && !engine.TryStop(fanIndex, out failureReason)) return false;
         if (!(resetFirmwareCurve ? active.TryResetFirmwareCurve(fanIndex, out failureReason)
             : active.TrySetAutomatic(fanIndex, out failureReason)))
         {
             return false;
         }
         journal?.Released(active, fanIndex);
-        overridden.Remove(fanIndex);
+        lock (overridden) overridden.Remove(fanIndex);
         return true;
     }
 
@@ -192,8 +219,8 @@ public sealed class FanCore : IDisposable
     ///   查的那张表，写进去就该一直算数，重启也还在。退出时偷偷改回去，
     ///   等于用户设的东西悄悄失效。</item>
     /// <item><b>软件曲线</b>（sw-curve）：底层只能设固定转速，所以曲线由
-    ///   <see cref="SoftwareCurveEngine"/> 在这里跑。它**要记进 overridden**，
-    ///   因为风扇确实被我们按着，退出必须交还。</item>
+    ///   <see cref="RunSoftwareCurveAsync"/> 执行。这里只记录计划，
+    ///   运行入口在首次驱动前准备临时接管，返回时交还固件。</item>
     /// </list>
     ///
     /// 界面上"固件跑曲线 / 软件跑曲线"那个词条，说的就是这两者的区别。
@@ -237,14 +264,14 @@ public sealed class FanCore : IDisposable
                 return false;
             }
             // 固件接手了，我们之前挂的软件曲线就该撤掉，否则两边抢同一把风扇。
-            if (engine?.IsRunning(fanIndex) == true && !engine.TryStop(fanIndex, out failureReason)) return false;
+            if ((engine?.HasPlan(fanIndex) == true || engine?.HasRuntime(fanIndex) == true) && !engine.TryStop(fanIndex, out failureReason)) return false;
             if (!active.TryWriteCurve(fanIndex, curve, out failureReason))
             {
-                if (active.HasPendingTemporaryRestore(fanIndex)) overridden.Add(fanIndex);
+                if (active.HasPendingTemporaryRestore(fanIndex)) { lock (overridden) overridden.Add(fanIndex); }
                 return false;
             }
             journal?.Released(active, fanIndex);
-            overridden.Remove(fanIndex);
+            lock (overridden) overridden.Remove(fanIndex);
             return true;
         }
 
@@ -279,8 +306,6 @@ public sealed class FanCore : IDisposable
             return false;
         }
 
-        if (!PrepareTemporaryTakeover(fanIndex, out failureReason)) return false;
-        engine ??= new SoftwareCurveEngine(active) { DiagnosticSink = detail => DiagnosticSink?.Invoke(detail) };
         var plan = new SoftwareCurvePlan(
             fanIndex,
             curve,
@@ -288,12 +313,11 @@ public sealed class FanCore : IDisposable
                 name,
                 () => Temperatures.Read(name),
                 Required: described.Role != FanRoles.Gpu && name.StartsWith("cpu", StringComparison.OrdinalIgnoreCase)))]);
-        if (!engine.TryStart(plan, out failureReason))
+        if (!engine!.TryRecordPlan(plan, out failureReason))
         {
             return false;
         }
-        // 风扇现在归我们按着，退出必须交还。
-        overridden.Add(fanIndex);
+        // Only record here. The host-owned run prepares ownership before its first drive.
         return true;
     }
 
@@ -306,16 +330,44 @@ public sealed class FanCore : IDisposable
     /// </summary>
     public string? ExecutionOf(int fanIndex)
     {
-        if (engine?.ActiveCurve(fanIndex) is not null)
+        if (engine?.IsRunning(fanIndex) == true)
         {
             return FanCurveExecutions.Software;
         }
+        if (SoftwarePlanRecorded(fanIndex)) return null;
         return Describe().FirstOrDefault(fan => fan.Index == fanIndex)?.FirmwareCurve is not null
             ? FanCurveExecutions.Firmware
             : null;
     }
 
+    public bool SoftwarePlanRecorded(int fanIndex) => engine?.HasPlan(fanIndex) == true;
+    public bool SoftwareCurveRunNeeded => engine?.SoftwareCurveRunNeeded == true;
+    public event Action<bool>? SoftwareCurveRunNeededChanged
+    {
+        add => GetEngine().SoftwareCurveRunNeededChanged += value;
+        remove { if (engine is not null) engine.SoftwareCurveRunNeededChanged -= value; }
+    }
+
+    /// <summary>Run software plans for the host-controlled lifetime. Only one run may be active.</summary>
+    public Task RunSoftwareCurveAsync(CancellationToken stop)
+    {
+        ObjectDisposedException.ThrowIf(disposed, this);
+        return GetEngine().RunAsync(stop);
+    }
+
+    private readonly object engineGate = new();
     private SoftwareCurveEngine? engine;
+    private SoftwareCurveEngine GetEngine()
+    {
+        lock (engineGate)
+            return engine ??= new SoftwareCurveEngine(() => active
+                ?? throw new InvalidOperationException("No available fan backend."))
+            {
+                DiagnosticSink = detail => DiagnosticSink?.Invoke(detail),
+                PrepareTakeover = fan => PrepareTemporaryTakeover(fan, out var failure)
+                    ? null : failure ?? "Temporary takeover preparation failed."
+            };
+    }
     public Action<string>? DiagnosticSink { get; set; }
     private string? lifecycleOperation;
     public string? InFlightOperation => engine?.InFlightOperation ?? Volatile.Read(ref lifecycleOperation);
@@ -335,7 +387,9 @@ public sealed class FanCore : IDisposable
         {
             return;
         }
-        foreach (var fanIndex in overridden.ToArray())
+        int[] indexes;
+        lock (overridden) indexes = overridden.ToArray();
+        foreach (var fanIndex in indexes)
         {
             try
             {
@@ -343,7 +397,7 @@ public sealed class FanCore : IDisposable
                 if (active.TryReleaseOverride(fanIndex, out _))
                 {
                     journal?.Released(active, fanIndex);
-                    overridden.Remove(fanIndex);
+                    lock (overridden) overridden.Remove(fanIndex);
                 }
             }
             catch (Exception)
@@ -390,7 +444,7 @@ public sealed class FanCore : IDisposable
             : new[] { fanIndex };
         if (journal is not null && !journal.TryRecord(active, affected, out failure)) return false;
         // Record in memory before the first attempt too: a failed native call may have partly written.
-        foreach (var index in affected) overridden.Add(index);
+        lock (overridden) foreach (var index in affected) overridden.Add(index);
         failure = null;
         return true;
     }

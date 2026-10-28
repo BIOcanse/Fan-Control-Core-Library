@@ -54,6 +54,7 @@ public sealed class UniwillWmiEcTransport : IUniwillFanHardware
 
     /// <summary>这台机器有没有这条通道。</summary>
     public bool IsAvailable => wmi.IsAvailable;
+    public FanOpenFailureKind AvailabilityFailureKind => wmi.AvailabilityFailureKind;
     public string? Diagnostic => channel.Diagnostic;
 
     /// <summary>读一个 EC 字节。读到连续一致的值才返回，否则 null。</summary>

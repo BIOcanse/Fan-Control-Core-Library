@@ -11,6 +11,12 @@ static void Check(bool result, string message) { if (!result) throw new Exceptio
 static void Until(Func<bool> ready, string message) { Check(SpinWait.SpinUntil(ready, 3000), message); }
 try
 {
+    if (args is ["--review-run-needed"]) { RunEntryReviewTests.RunNeeded(); return; }
+    if (args is ["--review-plan-removal"]) { RunEntryReviewTests.PlanRemoval(); return; }
+    RunEntryReviewTests.RunNeeded();
+    RunEntryReviewTests.PlanRemoval();
+    OpenFailureTests.Run();
+    SoftwareCurveRunTests.Run();
     CrashRecoveryTests.Run();
     CurveIsolationTests.Run();
     var curve = new FanCurvePoint[] { new(60, 35), new(95, 100) };
@@ -22,6 +28,7 @@ try
         Check(core.Open(), "fake backend opens");
         core.Temperatures.Push(new Dictionary<string, double> { ["cpu"] = 60 });
         Check(core.TryWriteCurve(0, curve, "software", out _), "software curve starts");
+        using var run = new CurveRun(core.RunSoftwareCurveAsync);
         Until(() => backend.Drives > 0, "curve drives fake fan");
         Check(core.ReadCurve(0)!.SequenceEqual(curve), "software receipt contains active software curve");
         Check(backend.CurveReads == 0, "software receipt does not read firmware");
@@ -50,7 +57,8 @@ try
     {
         var backend = new FakeBackend { FailDrive = true, RestoreFailures = 2 };
         using var engine = new SoftwareCurveEngine(backend, TimeSpan.FromMilliseconds(5));
-        Check(engine.TryStart(new(0, curve, [new("cpu", () => 60)]), out _), "failed-write fixture starts");
+        Check(engine.TryRecordPlan(new(0, curve, [new("cpu", () => 60)]), out _), "failed-write fixture starts");
+        using var run = new CurveRun(engine.RunAsync);
         Until(() => backend.AutomaticCalls >= 3 && !engine.IsRunning(0), "false writes hand back and failed restoration retries");
         Check(backend.Drives == 5, "stop driving after five failures");
     }
@@ -93,6 +101,7 @@ try
         Check(backend.Drives == 0, "missing CPU cannot take software ownership");
         core.Temperatures.Push(new Dictionary<string, double> { ["cpu"] = 60, ["gpu0"] = 70 });
         Check(core.TryWriteCurve(0, curve, "software", out _), "unknown fan starts with CPU and GPU temperatures");
+        using var run = new CurveRun(core.RunSoftwareCurveAsync);
         Until(() => backend.Drives > 0, "unknown fan drives with required CPU present");
     }
 
@@ -102,12 +111,13 @@ try
         var cpuAvailable = 1;
         var plan = new SoftwareCurvePlan(0, curve,
             [new("cpu", () => Volatile.Read(ref cpuAvailable) != 0 ? 60 : null, Required: true), new("gpu0", () => 100)]);
-        Check(engine.TryStart(plan, out _), "required-source fixture starts");
+        Check(engine.TryRecordPlan(plan, out _), "required-source fixture starts");
+        using var run = new CurveRun(engine.RunAsync);
         Until(() => backend.Drives > 0, "required-source fixture drives");
         Volatile.Write(ref cpuAvailable, 0);
         Thread.Sleep(50);
         var writes = backend.Drives;
-        Check(!engine.TryStart(plan, out _), "cannot replace a curve when required CPU is missing");
+        Check(!engine.TryRecordPlan(plan, out _), "cannot replace a curve when required CPU is missing");
         Check(SpinWait.SpinUntil(() => !engine.IsRunning(0), 6500), "required CPU loss cannot be replaced by fresh GPU; existing blind timeout restores firmware");
         Check(backend.Drives == writes && backend.AutomaticCalls > 0, "no GPU-only writes during CPU loss");
     }
