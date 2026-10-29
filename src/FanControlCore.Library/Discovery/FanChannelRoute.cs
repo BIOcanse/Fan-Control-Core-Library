@@ -20,15 +20,6 @@ public enum FanChannelCategory
     /// <summary>内核已经把风扇导出成标准属性。Linux 上有就用它，不必知道是什么品牌。</summary>
     Hwmon,
 
-    /// <summary>
-    /// 主板上的 Super I/O（Nuvoton / ITE / Fintek / Winbond）。台式机的主路径。
-    ///
-    /// **排在厂商固件之前**：台式机上根本没有"厂商风扇固件接口"这回事，
-    /// 而笔记本上又枚举不到可写的 Super I/O 接头 —— 两边天然不重叠，
-    /// 谁在前不影响结果。放前面是因为台式机上它才是那条正路。
-    /// </summary>
-    SuperIo,
-
     /// <summary>厂商固件自己暴露的 WMI / ACPI 方法。Windows 上的主路径。</summary>
     VendorFirmware,
 
@@ -39,7 +30,18 @@ public enum FanChannelCategory
     RawEc,
 
     /// <summary>Dell 的 SMM 特殊路径。</summary>
-    Smm
+    Smm,
+
+    /// <summary>
+    /// 主板上的 Super I/O（Nuvoton / ITE / Fintek / Winbond），借道宿主的 LibreHardwareMonitor。台式机的主路径。
+    ///
+    /// **排在所有笔记本通道之后。** 笔记本通道的识别依据是这台机器自己的固件接口或固件指纹，
+    /// 是专门认这台机器的；这条的识别依据只是"宿主的 LHM 主板树里有没有 Control 传感器"，
+    /// 是通用的。笔记本上 LHM 也可能报出 Control（例如某些 EC 芯片），那时专门的一条必须先赢。
+    /// 台式机上笔记本通道一条都认不出，最后落到这里，结果不变。
+    /// 宿主没有传入已打开的 <c>Computer</c> 时这条不可用（见 <see cref="FanCoreOptions.LibreHardwareMonitorComputer"/>）。
+    /// </summary>
+    SuperIo
 }
 
 /// <summary>
@@ -107,16 +109,6 @@ public sealed record FanChannelRoute(
         [
             // 厂商固件接口。识别依据都是各家固件自己的 WMI 接口在不在 ——
             // GUID 是固件里写死的，各家互不重叠，所以最多命中一条。
-            /*
-             * 台式主板的风扇接头。**一级路由键是控制器芯片，不是主板品牌** ——
-             * 华硕/微星/技嘉的台式板绝大多数都是那几颗 Super I/O，
-             * 按品牌分只会把同一件事写好几遍。
-             *
-             * 识别依据：能不能枚举到可写的接头。笔记本上枚举不到（风扇在整机 EC 上），
-             * 所以它和下面那几条笔记本通道天然不重叠。
-             */
-            new(FanChannelCategory.SuperIo, () => new DesktopSuperIoFanBackend(options.LibreHardwareMonitorPath)),
-
             new(FanChannelCategory.VendorFirmware, static () => new AsusWmiFanBackend()),
             new(FanChannelCategory.VendorFirmware, static () => new HpWmiFanBackend()),
             new(FanChannelCategory.VendorFirmware, () => new LenovoWmiFanBackend(options.StateDirectory)),
@@ -124,7 +116,16 @@ public sealed record FanChannelRoute(
 
             // 同方公版：借道固件的 ACPI WMI 方法，但读写的是 EC 寄存器，
             // 所以归 Raw EC 那一类 —— 规矩也按那一类办：固件指纹认不出就只读。
-            new(FanChannelCategory.RawEc, () => new UniwillWmiFanBackend(options.StateDirectory))
+            new(FanChannelCategory.RawEc, () => new UniwillWmiFanBackend(options.StateDirectory)),
+
+            /*
+             * 台式主板的风扇接头。**一级路由键是控制器芯片，不是主板品牌** ——
+             * 华硕/微星/技嘉的台式板绝大多数都是那几颗 Super I/O，
+             * 按品牌分只会把同一件事写好几遍。
+             *
+             * 识别依据：宿主传入的 LHM 主板树里能不能枚举到可写的接头。排在最后，见类别上的说明。
+             */
+            new(FanChannelCategory.SuperIo, () => new DesktopSuperIoFanBackend(options.LibreHardwareMonitorComputer))
         ];
     }
 }

@@ -36,7 +36,7 @@ internal static class TemperatureKindTests
         OrderedDelivery();
         DynamicTemperatures();
         BlindAndRetry();
-        Console.WriteLine("Temperature kinds: typed/JSON batches, plan facts, ordered notifications, dynamic names, blind timeout and retry passed.");
+        Console.WriteLine("Temperature kinds: typed/JSON batches, plan facts, ordered notifications, dynamic names, kept blind plans and retry passed.");
     }
 
     private static void TypedAndJson()
@@ -177,25 +177,43 @@ internal static class TemperatureKindTests
         }
     }
 
+    /// <summary>
+    /// Review B-M1: a blind timeout hands a driven fan back but keeps the user's plan and its kind, so the host keeps
+    /// pushing and the plan resumes by itself; a fan that was never driven is not touched at all.
+    /// </summary>
     private static void BlindAndRetry()
     {
         var backend = new Backend { FailRelease = true };
         using var core = new FanCore(backend);
         using var session = new FanControlSession(core);
+        core.CurveEngine.BlindTimeout = TimeSpan.FromMilliseconds(500);
         var changes = new ConcurrentQueue<string>();
         session.SoftwareCurveTemperatureKindsChanged += kinds => changes.Enqueue(string.Join(",", kinds));
         Record(session, 0);
         using var run = new CurveRun(session.RunSoftwareCurveAsync);
         Thread.Sleep(300);
         Check(backend.Writes.IsEmpty && backend.Releases == 0 && core.SoftwarePlanRecorded(0), "blind from first tick waits without driving or premature release");
-        Check(SpinWait.SpinUntil(() => !core.SoftwarePlanRecorded(0) && changes.Count == 2, 6500), "initial missing kind reaches existing blind timeout and removes plan");
-        Check(backend.Writes.IsEmpty && backend.Releases > 0, "blind timeout hands back without driving");
-        Check(session.SoftwareCurveRunNeeded && session.SoftwareCurveTemperatureKinds.Count == 0,
-            "only a hand-back retry remains: run needed with empty kinds");
+        Until(() => core.SoftwareCurveSuspension(0) == FanCurveSuspension.Blind, "initial missing kind reaches the blind timeout and suspends the plan");
+        Thread.Sleep(200);
+        Check(backend.Writes.IsEmpty && backend.Releases == 0, "a never-driven fan is not touched by the blind hand-back");
+        Check(core.SoftwarePlanRecorded(0) && session.SoftwareCurveRunNeeded
+            && session.SoftwareCurveTemperatureKinds.SequenceEqual(new[] { "cpu" }), "plan and its kind are kept, so the host keeps pushing");
+        Check(changes.SequenceEqual(new[] { "cpu" }), "suspension emits no kinds change");
+
+        session.PushTemperatures([new("cpu", 40, DateTime.UtcNow.Ticks)]);
+        Until(() => backend.Writes.Contains((0, 40)) && core.SoftwareCurveSuspension(0) is null, "temperature returns: plan resumes by itself");
+        session.PushTemperatures([]);
+        Until(() => core.SoftwareCurveSuspension(0) == FanCurveSuspension.Blind && backend.Releases > 0,
+            "driven fan goes blind: handed back, plan kept");
+        Check(core.ExecutionOf(0) is null && core.SoftwarePlanRecorded(0), "receipt: recorded, not executing");
+
         var failed = Send(session, """{"op":"auto","fan":0}""");
-        Check(!failed.GetProperty("ok").GetBoolean(), "pending release returns unsuccessful receipt");
+        Check(!failed.GetProperty("ok").GetBoolean() && failed.GetProperty("errorKind").GetString() == "Other",
+            "pending release returns an unsuccessful receipt with the backend's (untyped) kind");
         Receipt(failed);
-        Check(changes.SequenceEqual(new[] { "cpu", "" }), "blind timeout emits exactly the two kinds changes");
+        Check(!core.SoftwarePlanRecorded(0) && session.SoftwareCurveRunNeeded && session.SoftwareCurveTemperatureKinds.Count == 0,
+            "only a hand-back retry remains: run needed with empty kinds");
+        Check(changes.SequenceEqual(new[] { "cpu", "" }), "explicit removal emits exactly the two kinds changes");
         backend.FailRelease = false;
         Until(() => !core.SoftwareCurveRunNeeded, "retry succeeds without any temperature push");
         Check(changes.Count == 2, "retry-only completion does not emit a kinds change");

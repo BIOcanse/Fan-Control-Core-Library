@@ -27,8 +27,13 @@ public sealed record FanState(
     /// 那种通道上不该假装能设 70% —— 收到 70% 就给 100%，是在骗用户。
     /// </summary>
     bool SupportsDuty,
-    /// <summary>现在是固件在自动控制，还是被我们固定住了。</summary>
-    bool AutomaticControl);
+    /// <summary>
+    /// 现在是固件在自动控制（true），还是被我们固定住或接管了（false）。
+    ///
+    /// **读不到就是 null**，和读到"自动"是两回事：模式寄存器读失败时不能报一个确定的状态。
+    /// 固件执行的用户曲线算固件自动控制；临时定速表、全速和软件接管都是 false。
+    /// </summary>
+    bool? AutomaticControl);
 
 /// <summary>
 /// 一个风扇**能做什么**。
@@ -84,6 +89,12 @@ public sealed record FanDescription(
     ///
     /// **这件事必须让用户事先知道**，所以由通道如实报出来，
     /// 界面在他选"软件接管"之前就把话说清楚。报不出来就是 false，不猜。
+    ///
+    /// 这种通道上整机开关由**正在接管的风扇共同持有**（见 <see cref="IFanBackend.SharedTakeoverHolders"/>）：
+    /// 软件驱动和全速都算持有；交还一把只放下它自己那一份，最后一把也交还时才关掉开关。
+    /// 持有期间固件不执行任何一把的表，所以别的风扇的定速表和固件曲线不生效（读数报非自动，
+    /// 曲线回执不报 firmware）；在另一把持有时要求某把走定速或固件曲线，会被拒绝为
+    /// <see cref="FanCommandErrorKind.SharedTakeoverHeld"/>，而不是悄悄关掉别人的接管。
     /// </summary>
     bool SoftwareTakeoverCoversAllFans = false,
     /// <summary>
@@ -124,7 +135,13 @@ public sealed record FanDescription(
     /// </summary>
     string? FirmwareCurveRequires = null,
     /// <summary>模块实现了显式原表恢复；不表示当前一定有可用原表。</summary>
-    bool SupportsFirmwareCurveReset = false);
+    bool SupportsFirmwareCurveReset = false,
+    /// <summary>
+    /// 占空比写 0 能不能让风扇停转。false 表示这条通道收不了 0（Acer 的自定义转速只收
+    /// <see cref="MinimumOnPercent"/> 到 100）：软件曲线低于下限时停在下限而不是停转，
+    /// 软件控制组里定 0% 被拒绝为 <see cref="FanCommandErrorKind.Unsupported"/>。
+    /// </summary>
+    bool CanStop = true);
 
 /// <summary>风扇吹的是什么。</summary>
 public static class FanRoles
@@ -188,7 +205,11 @@ public interface IFanBackend : IDisposable
     string Name { get; }
     IReadOnlyList<string> Diagnostics => [];
 
-    /// <summary>Stable channel identity independent of enumeration order; ambiguous identities block recovery.</summary>
+    /// <summary>
+    /// Stable channel identity independent of enumeration order; ambiguous identities block recovery.
+    /// The default combines the display name, role and firmware curve kind. Backends whose display names may be
+    /// renamed or localized override it with a hardware channel key, so pending recovery survives a rename.
+    /// </summary>
     string? RecoveryIdentity(int fanIndex)
     {
         var fan = Describe().FirstOrDefault(fan => fan.Index == fanIndex);
@@ -285,4 +306,88 @@ public interface IFanBackend : IDisposable
     /// <summary>释放临时定速或软件接管，保留用户设定的持久固件曲线。</summary>
     bool TryReleaseOverride(int fanIndex, out string? failureReason)
         => TrySetAutomatic(fanIndex, out failureReason);
+
+    /*
+     * Typed attempts, in the same form as TryOpen(out FanOpenFailureKind, out string?). The kind is meaningful only
+     * when the attempt returns false. Backends without typed evidence keep these defaults: they call the untyped
+     * member above and report Other, and the set attempt reports no applied percentage.
+     */
+
+    /// <summary>
+    /// <see cref="TrySetDuty(int, double, out string?)"/> with its typed failure kind, and on success the percentage
+    /// the hardware was actually given after this channel's clamping and quantization (null when the channel does not say).
+    /// </summary>
+    bool TrySetDuty(int fanIndex, double percent, out double? appliedPercent, out FanCommandErrorKind errorKind,
+        out string? failureReason)
+    {
+        appliedPercent = null;
+        errorKind = FanCommandErrorKind.Other;
+        return TrySetDuty(fanIndex, percent, out failureReason);
+    }
+
+    bool TrySetFullSpeed(int fanIndex, out FanCommandErrorKind errorKind, out string? failureReason)
+    {
+        errorKind = FanCommandErrorKind.Other;
+        return TrySetFullSpeed(fanIndex, out failureReason);
+    }
+
+    bool TrySetAutomatic(int fanIndex, out FanCommandErrorKind errorKind, out string? failureReason)
+    {
+        errorKind = FanCommandErrorKind.Other;
+        return TrySetAutomatic(fanIndex, out failureReason);
+    }
+
+    bool TryResetFirmwareCurve(int fanIndex, out FanCommandErrorKind errorKind, out string? failureReason)
+    {
+        errorKind = FanCommandErrorKind.Other;
+        return TryResetFirmwareCurve(fanIndex, out failureReason);
+    }
+
+    bool TryReleaseOverride(int fanIndex, out FanCommandErrorKind errorKind, out string? failureReason)
+    {
+        errorKind = FanCommandErrorKind.Other;
+        return TryReleaseOverride(fanIndex, out failureReason);
+    }
+
+    bool TryWriteCurve(int fanIndex, IReadOnlyList<FanCurvePoint> curve, out FanCommandErrorKind errorKind,
+        out string? failureReason)
+    {
+        errorKind = FanCommandErrorKind.Other;
+        return TryWriteCurve(fanIndex, curve, out failureReason);
+    }
+
+    /// <summary>
+    /// <see cref="TryDriveDuty(int, double, out string?)"/> with its typed failure kind. The software engine reads
+    /// <see cref="FanCommandErrorKind.SharedTakeoverHeld"/> as "refused before any write" and suspends the plan instead
+    /// of counting a failed write.
+    /// </summary>
+    bool TryDriveDuty(int fanIndex, double percent, out FanCommandErrorKind errorKind, out string? failureReason)
+    {
+        errorKind = FanCommandErrorKind.Other;
+        return TryDriveDuty(fanIndex, percent, out failureReason);
+    }
+
+    /// <summary>
+    /// True when this backend counts <see cref="SharedTakeoverHolders"/>: releasing one fan keeps the shared takeover
+    /// while another fan holds it. Only then does the software engine rewrite the other driven fans after an explicit
+    /// release. A covers-all channel without holder counting (for example Acer, whose release switches the whole
+    /// machine back to automatic) gets no rewrite, because the rewrite would take the just-released fan over again.
+    /// </summary>
+    bool SharedTakeoverCountsHolders => false;
+
+    /// <summary>
+    /// Fans that share one control switch and can only change between firmware and software control together.
+    /// Read without hardware access. Empty when every fan switches on its own.
+    /// </summary>
+    IReadOnlyList<FanControlGroup> ControlGroups => [];
+
+    /// <summary>
+    /// Fans whose temporary takeover currently holds this channel's shared takeover
+    /// (<see cref="FanDescription.SoftwareTakeoverCoversAllFans"/>): a software drive or full speed on that fan.
+    ///
+    /// A release clears the shared mode only when no holder remains, and a fixed-duty or firmware-curve write on a fan
+    /// is rejected as <see cref="FanCommandErrorKind.SharedTakeoverHeld"/> while another fan holds it. Read without
+    /// hardware access. Empty for channels without a shared takeover.
+    /// </summary>
+    IReadOnlyCollection<int> SharedTakeoverHolders => Array.Empty<int>();
 }

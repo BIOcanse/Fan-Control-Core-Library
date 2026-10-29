@@ -11,7 +11,7 @@ namespace FanControlCore.Protocols;
 /// 品牌只在少数需要 bridge/quirk 的板子上才有意义。所以这里是一条**通用**通道，
 /// 不是"华硕风扇后端""微星风扇后端"。
 ///
-/// 这条通道**借道 LibreHardwareMonitor**，理由有三：
+/// 这条通道**借道宿主的 LibreHardwareMonitor**，理由有三：
 ///
 /// <list type="number">
 /// <item>它已经内置 PawnIO 的 LpcIO，**不需要 WinRing0** —— 那类端口 I/O 驱动
@@ -22,27 +22,29 @@ namespace FanControlCore.Protocols;
 ///   恢复那一半正是这件事里最不能出错的部分。</item>
 /// </list>
 ///
-/// **反射加载，不在编译期引用。** LHM 是可选组件（用户未必装），而且许可证
-/// （MPL-2.0）和这个核心（Apache-2.0）不是一回事 —— 这和处理器那条路把
-/// GPL 的 ZenStates 隔离在独立进程里是同一个道理。装了就用，没装就如实说缺什么。
+/// **只借用，不自己开。** LibreHardwareMonitor 0.9.6 的 <c>Computer.Open</c> 会替换、<c>Close</c> 会释放
+/// 进程级静态资源（CPUID/RDTSC 代码页、ISA/PCI/EC 互斥）。库自己再开一份，就会和宿主那份互相拆台：
+/// 互斥被换掉或关掉后，主板读数和风扇写入静默失效，CPUID 委托变空。所以这条通道只用宿主经
+/// <see cref="FanCoreOptions.LibreHardwareMonitorComputer"/> 传入的、已经打开并启用了主板组的实例；
+/// 宿主不传，这条通道就不可用 —— 没有"按路径自己开一份"的退路。
+///
+/// **反射访问，不在编译期引用。** LHM 的许可证（MPL-2.0）和这个核心（Apache-2.0）不是一回事，
+/// 这和处理器那条路把 GPL 的 ZenStates 隔离在独立进程里是同一个道理。
 /// </summary>
 [SupportedOSPlatform("windows")]
 public sealed class DesktopSuperIoFanBackend : IFanBackend
 {
+    private const string ComputerTypeName = "LibreHardwareMonitor.Hardware.Computer";
+
+    /// <summary>The host's open Computer (see <see cref="FanCoreOptions.LibreHardwareMonitorComputer"/>); never opened, closed or updated here.</summary>
+    private readonly object? hostComputer;
+
     /// <summary>
-    /// 宿主用这个环境变量告诉我们 LibreHardwareMonitor 装在哪儿。
-    ///
-    /// **不去猜路径。** 猜一个相对目录，装法一变就找不到，而且找不到的时候
-    /// 报出来的原因会是"这台机器没有 Super I/O"，那是假的。
+    /// <paramref name="hostComputer"/> is the host's already open LibreHardwareMonitor <c>Computer</c> with its
+    /// motherboard group enabled; null makes this route unavailable.
     /// </summary>
-    internal const string LibraryPathVariable = "FANCONTROLCORE_LHM_PATH";
+    public DesktopSuperIoFanBackend(object? hostComputer) => this.hostComputer = hostComputer;
 
-    private const string LibraryFileName = "LibreHardwareMonitorLib.dll";
-
-    private readonly string? libraryPath;
-    public DesktopSuperIoFanBackend() : this(Environment.GetEnvironmentVariable(LibraryPathVariable)) { }
-    public DesktopSuperIoFanBackend(string? libraryPath) => this.libraryPath = libraryPath;
-    private object? computer;
     private readonly List<Channel> channels = [];
 
     public string Name => "desktop-superio";
@@ -53,6 +55,10 @@ public sealed class DesktopSuperIoFanBackend : IFanBackend
 
     public bool TryOpen(out string? unavailableReason) => TryOpen(out _, out unavailableReason);
 
+    /// <summary>
+    /// 借用宿主已经打开的 <c>Computer</c>：只看它的主板那棵树，不 Open、不 Close、不 Update。
+    /// 读不到可写接头时也不关它 —— 它不是我们的。
+    /// </summary>
     public bool TryOpen(out FanOpenFailureKind failureKind, out string? unavailableReason)
     {
         failureKind = FanOpenFailureKind.Other;
@@ -62,58 +68,49 @@ public sealed class DesktopSuperIoFanBackend : IFanBackend
             unavailableReason = "这条通道只有 Windows 上有（Linux 上直接走 hwmon）。";
             return false;
         }
-        if (ResolveLibrary() is not { } libraryPath)
+        if (hostComputer is null)
         {
-            unavailableReason = "需要 LibreHardwareMonitor 组件才能控制主板风扇接头。";
+            // 宿主明确没有提供：这是确定的"这条路没有"，不是未知故障。
+            failureKind = FanOpenFailureKind.NoSupportedController;
+            unavailableReason = "宿主没有提供已打开的 LibreHardwareMonitor Computer，主板风扇接头这条路不可用。";
             return false;
         }
-
+        var type = hostComputer.GetType();
+        if (type.FullName != ComputerTypeName)
+        {
+            unavailableReason = "宿主传入的不是 LibreHardwareMonitor 的 Computer。";
+            return false;
+        }
+        if (type.GetProperty("IsMotherboardEnabled")?.GetValue(hostComputer) is not true)
+        {
+            // 宿主没开主板这一块：不替它打开，如实说缺什么。
+            unavailableReason = "宿主的 LibreHardwareMonitor 没有启用主板，读不到风扇接头。";
+            return false;
+        }
         try
         {
-            var assembly = Assembly.LoadFrom(libraryPath);
-            if (assembly.GetType("LibreHardwareMonitor.Hardware.Computer") is not { } computerType)
-            {
-                unavailableReason = "LibreHardwareMonitor 组件的版本不对，找不到入口类型。";
-                return false;
-            }
-
-            var instance = Activator.CreateInstance(computerType);
-            if (instance is null)
-            {
-                unavailableReason = "起不来 LibreHardwareMonitor。";
-                return false;
-            }
-            /*
-             * **只开主板这一块。** 别的（CPU、显卡、硬盘）我们各有各的路，
-             * 在这里多开一块只是白占一次采集和一次驱动加载。
-             */
-            computerType.GetProperty("IsMotherboardEnabled")?.SetValue(instance, true);
-            computerType.GetMethod("Open")?.Invoke(instance, null);
-            computer = instance;
-
-            CollectChannels(instance);
-            if (channels.Count == 0)
-            {
-                Close();
-                /*
-                 * 认出主板但一个可写风扇通道都没有 —— 笔记本就是这样
-                 * （风扇挂在整机 EC 上，不是标准 Super I/O）。
-                 * 说清楚"没有接头"，别说成"没装组件"。
-                 */
-                unavailableReason = "这台机器上没有可控的主板风扇接头。";
-                return false;
-            }
-            unavailableReason = null;
-            return true;
+            CollectChannels(hostComputer);
         }
         catch (Exception error) when (error is not OutOfMemoryException)
         {
-            Close();
+            channels.Clear();
             var cause = error is TargetInvocationException { InnerException: { } inner } ? inner : error;
             if (cause is UnauthorizedAccessException) failureKind = FanOpenFailureKind.AccessDenied;
-            unavailableReason = $"打不开主板风扇通道：{error.Message}";
+            unavailableReason = $"读不了宿主 LibreHardwareMonitor 的主板：{cause.Message}";
             return false;
         }
+        if (channels.Count == 0)
+        {
+            /*
+             * 认出主板但一个可写风扇通道都没有 —— 笔记本就是这样
+             * （风扇挂在整机 EC 上，不是标准 Super I/O）。
+             * 说清楚"没有接头"，别说成"没装组件"。
+             */
+            unavailableReason = "这台机器上没有可控的主板风扇接头。";
+            return false;
+        }
+        unavailableReason = null;
+        return true;
     }
 
     /// <summary>
@@ -123,30 +120,35 @@ public sealed class DesktopSuperIoFanBackend : IFanBackend
     /// 以及同一颗芯片上序号相同的 <c>Fan</c> 传感器（读转速的口）。
     /// 读不到转速也照收 —— 只读的转速不影响写，而且没有转速回读时，
     /// 用户至少还能看见这个接头存在。
+    ///
+    /// <c>Computer.Hardware</c> 在 0.9.6 是 <c>IList&lt;IHardware&gt;</c>，不是数组，
+    /// 所以按 <see cref="System.Collections.IEnumerable"/> 走。只走主板那几棵树、不调 Update
+    /// （宿主开着 CPU、内存等别的组，那些不归我们碰；更新节奏也是宿主的）。
     /// </summary>
     private void CollectChannels(object instance)
     {
-        var hardware = instance.GetType().GetProperty("Hardware")?.GetValue(instance) as Array;
-        if (hardware is null)
+        if (instance.GetType().GetProperty("Hardware")?.GetValue(instance) is not System.Collections.IEnumerable hardware)
         {
             return;
         }
-        // while + 显式栈，不递归。
+        // while + 显式栈，不递归；节点数有上限。
+        const int MaximumNodes = 4096;
+        var visited = 0;
         var pending = new Stack<object>();
         foreach (var item in hardware)
         {
-            if (item is not null)
+            if (item?.GetType().GetProperty("HardwareType")?.GetValue(item)?.ToString() == "Motherboard")
             {
                 pending.Push(item);
             }
         }
         while (pending.Count > 0)
         {
+            if (++visited > MaximumNodes) throw new InvalidDataException("LibreHardwareMonitor hardware tree exceeds its bound.");
             var node = pending.Pop();
             var type = node.GetType();
-            type.GetMethod("Update")?.Invoke(node, null);
 
-            if (type.GetProperty("SubHardware")?.GetValue(node) is Array children)
+            if (type.GetProperty("SubHardware")?.GetValue(node) is System.Collections.IEnumerable children)
             {
                 foreach (var child in children)
                 {
@@ -156,7 +158,7 @@ public sealed class DesktopSuperIoFanBackend : IFanBackend
                     }
                 }
             }
-            if (type.GetProperty("Sensors")?.GetValue(node) is not Array sensors)
+            if (type.GetProperty("Sensors")?.GetValue(node) is not System.Collections.IEnumerable sensors)
             {
                 continue;
             }
@@ -196,22 +198,6 @@ public sealed class DesktopSuperIoFanBackend : IFanBackend
         }
     }
 
-    private string? ResolveLibrary()
-    {
-        var root = libraryPath;
-        if (string.IsNullOrWhiteSpace(root))
-        {
-            return null;
-        }
-        // 给的可能是目录，也可能直接是那个 dll。两种都认。
-        if (File.Exists(root))
-        {
-            return root;
-        }
-        var candidate = Path.Combine(root, LibraryFileName);
-        return File.Exists(candidate) ? candidate : null;
-    }
-
     /// <summary>
     /// 每个接头一个通道。
     ///
@@ -241,7 +227,10 @@ public sealed class DesktopSuperIoFanBackend : IFanBackend
         var states = new List<FanState>(channels.Count);
         foreach (var channel in channels)
         {
-            channel.Node.GetType().GetMethod("Update")?.Invoke(channel.Node, null);
+            /*
+             * 不调 Update：宿主自己的更新线程也在改同一批传感器对象
+             * （LHM 的传感器值和历史不是线程安全的），读数的新鲜度就是宿主更新的节奏。
+             */
             var duty = Value(channel.Control.GetType()
                 .GetProperty("Sensor")?.GetValue(channel.Control));
             var mode = channel.Control.GetType()
@@ -331,25 +320,8 @@ public sealed class DesktopSuperIoFanBackend : IFanBackend
     private static double? Value(object? sensor)
         => sensor?.GetType().GetProperty("Value")?.GetValue(sensor) as float?;
 
-    private void Close()
-    {
-        if (computer is null)
-        {
-            return;
-        }
-        try
-        {
-            computer.GetType().GetMethod("Close")?.Invoke(computer, null);
-        }
-        catch (TargetInvocationException)
-        {
-            // 关不掉也没别的办法了；下面照样把引用丢掉。
-        }
-        computer = null;
-        channels.Clear();
-    }
-
-    public void Dispose() => Close();
+    /// <summary>The host's Computer stays open: it belongs to the host. Only our channel references are dropped.</summary>
+    public void Dispose() => channels.Clear();
 
     /// <summary>一个主板风扇接头：往哪儿写、从哪儿读转速、归哪块子硬件。</summary>
     private sealed record Channel(

@@ -119,7 +119,9 @@ try
         var writes = backend.Drives;
         Check(engine.TryRecordPlan(plan, out _), "replacement does not require a current CPU observation");
         Check(SpinWait.SpinUntil(() => !engine.IsRunning(0), 6500), "required CPU loss cannot be replaced by fresh GPU; existing blind timeout restores firmware");
-        Check(backend.Drives == writes && backend.AutomaticCalls > 0, "no GPU-only writes during CPU loss");
+        Until(() => backend.AutomaticCalls > 0, "blind hand-back restores firmware after the decision");
+        Check(backend.Drives == writes, "no GPU-only writes during CPU loss");
+        Check(engine.Suspension(0) == FanCurveSuspension.Blind, "blind plan is kept and reported as suspended");
     }
 
     {
@@ -141,14 +143,17 @@ try
     {
         LenovoFirmwareCurveTests.Run();
         UniwillFirmwareOwnershipTests.Run();
+        UniwillSharedModeTests.Run();
         var backendType = typeof(FanControlCore.Protocols.DesktopSuperIoFanBackend);
-        using var backend = new FanControlCore.Protocols.DesktopSuperIoFanBackend();
+        using var backend = new FanControlCore.Protocols.DesktopSuperIoFanBackend(null);
         var channels = (System.Collections.IList)backendType.GetField("channels", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(backend)!;
         var channelType = backendType.GetNestedType("Channel", System.Reflection.BindingFlags.NonPublic)!;
         channels.Add(Activator.CreateInstance(channelType, [0, "owned fake", new object(), null, new object()])!);
         Check(!backend.TrySetDuty(0, 45, out _), "missing reflection write method cannot report success");
         Check(!backend.TrySetAutomatic(0, out _), "missing reflection restore method cannot report success");
     }
+
+    ReviewFixTests.Run();
 
     Console.WriteLine("FanControlCore regressions: ownership transitions, false-write restoration, software receipts, observation freshness, and slow-command temperature delivery passed.");
 }

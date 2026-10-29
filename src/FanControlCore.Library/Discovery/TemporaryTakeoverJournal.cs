@@ -62,8 +62,8 @@ internal sealed class TemporaryTakeoverJournal(FanCoreOptions options) : IDispos
                 var targets = new List<(Entry Entry, int Index)>();
                 foreach (var entry in state!.Fans)
                 {
-                    var matches = descriptions.Where(fan =>
-                        backend.RecoveryIdentity(fan.Index) == entry.Identity).ToArray();
+                    var matches = descriptions.Where(fan => backend.RecoveryIdentity(fan.Index) == entry.Identity
+                        || LegacyIdentity(fan) == entry.Identity).ToArray();
                     if (entry.Backend != backend.Name || matches.Length != 1 || !matches[0].Writable)
                         throw new InvalidDataException("Pending fan takeover does not match the detected writable hardware.");
                     targets.Add((entry, matches[0].Index));
@@ -106,6 +106,15 @@ internal sealed class TemporaryTakeoverJournal(FanCoreOptions options) : IDispos
             catch (Exception error) { failure = "Fan takeover was not recorded: " + error.Message; return false; }
         }
     }
+
+    /*
+     * Compatibility, delete condition: remove LegacyIdentity once no host can still hold a journal written before
+     * backends overrode RecoveryIdentity with a hardware channel key (0.1.0-dev.7). Such records
+     * use the former default "name\nrole\nfirmwareCurve" for every backend; for backends that keep the default it is
+     * the current identity anyway. Pending records are resolved by the first Open of a newer session, so one
+     * successful session per installation retires them.
+     */
+    private static string LegacyIdentity(FanDescription fan) => fan.Name + "\n" + fan.Role + "\n" + fan.FirmwareCurve;
 
     public void Released(IFanBackend backend, int index)
     {

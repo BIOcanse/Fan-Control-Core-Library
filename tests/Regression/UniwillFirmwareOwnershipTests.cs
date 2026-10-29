@@ -113,7 +113,8 @@ internal static class UniwillFirmwareOwnershipTests
         var hardware = new Hardware(initiallyEnabled);
         var original0 = hardware.Table(0); var original1 = hardware.Table(1);
         var originalFlag = hardware.Values[UniwillFanTable.UseCustomTablesRegister];
-        using var core = new FanCore(new UniwillWmiFanBackend(hardware, directory, () => Device));
+        var backend = new UniwillWmiFanBackend(hardware, directory, () => Device);
+        using var core = new FanCore(backend);
         Check(core.Open(), "core opens fake hardware");
         Check(core.TryWriteCurve(0, Curve(60), "firmware", out _), "first persistent curve");
         Check(core.TryWriteCurve(0, Curve(80), "firmware", out _), "curve update keeps first original");
@@ -125,8 +126,10 @@ internal static class UniwillFirmwareOwnershipTests
         Check(core.TrySetDuty(0, 25, out _), "temporary duty over own persistent curve");
         Check(core.TrySetAutomatic(0, out _), "temporary duty handback");
         Check(hardware.Table(0).SequenceEqual(persistent) && hardware.CustomEnabled, "handback returns to preceding persistent curve");
-        Check(core.TrySetFullSpeed(1, out _), "temporary global boost");
-        Check(core.TrySetAutomatic(1, out _), "boost handback leaves firmware tables alone");
+        // Through FanCore a boost needs the control group under software control; the backend's own boost is what
+        // this checks: setting and clearing the machine-wide bit leaves the firmware tables alone.
+        Check(backend.TrySetFullSpeed(1, out _), "temporary global boost");
+        Check(backend.TrySetAutomatic(1, out _), "boost handback leaves firmware tables alone");
         Check(hardware.Table(0).SequenceEqual(persistent) && hardware.CustomEnabled, "boost does not disable custom curve");
         Check(core.TrySetAutomatic(0, out _, resetFirmwareCurve: true), "explicit curve cancel");
         Check(hardware.Table(0).SequenceEqual(original0), "raw first original restored rather than latest edit");

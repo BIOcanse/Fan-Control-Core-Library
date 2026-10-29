@@ -13,10 +13,14 @@ namespace FanControlCore.Protocols;
 /// <list type="bullet">
 /// <item>写之前必须过固件指纹检查（<see cref="UniwillFanProfileTable.IsSupported"/>）——
 ///   固件自己说有风扇控制，我们才写。认不出的机器**只读**。</item>
-/// <item>占空比夹在 profile 声明的范围里，而且不允许落进"转不起来"的那一段。</item>
+/// <item>占空比夹在 profile 声明的范围里，而且不允许落进"转不起来"的那一段；
+///   这个下限由 Describe 的 <c>MinimumOnPercent</c> 报出来，定速回执带实际下发的百分比。</item>
 /// <item>固定转速保留固件温区，只修改各区转速；曲线按用户明确选择的点布局，
 ///   不额外插入高温强制区（见 <see cref="UniwillFanTable"/>）。</item>
-/// <item>退出时恢复已保存的临时定速表并清掉全速模式位；持久曲线保留。
+/// <item>全速模式位（0x0751 的 0x40）是整机共用的，由正在接管的风扇共同持有：
+///   软件驱动和全速各记一份，交还一把只放下它那一份，最后一份放下才清位；
+///   另一把持有时拒绝会清位的定速表和固件曲线（<see cref="FanCommandErrorKind.SharedTakeoverHeld"/>）。</item>
+/// <item>退出时恢复已保存的临时定速表并放下全速模式位；持久曲线保留。
 ///   明确取消曲线才恢复对应原表，整机自定义表使能由剩余表的所有权决定。</item>
 /// </list>
 /// </summary>
@@ -26,7 +30,15 @@ public sealed partial class UniwillWmiFanBackend : IFanBackend
     private readonly IUniwillFanHardware transport;
     private readonly string? baselineDirectory;
     private readonly Lazy<string?> identity;
+    /// <summary>Serializes every mutation of the EC fan state and the baseline files.</summary>
     private readonly object tableGate = new();
+    /// <summary>
+    /// Fans whose software drive or full speed currently holds the shared mode bit. Mutated only while
+    /// <see cref="tableGate"/> is held (so check-then-clear cannot race a drive); read under its own small lock so
+    /// queries never wait behind table IO.
+    /// </summary>
+    private readonly HashSet<int> sharedModeHolders = [];
+    private readonly object holdersGate = new();
     private bool writable;
     private ushort secondFanRpmLow = UniwillFanProfileTable.SecondFanRpmLow;
     private readonly Func<(string? Manufacturer, string? Model)> readSystemModel;
@@ -47,6 +59,28 @@ public sealed partial class UniwillWmiFanBackend : IFanBackend
 
     public string Name => "uniwill-wmi-ec";
     public IReadOnlyList<string> Diagnostics => transport.Diagnostic is { } detail ? [detail] : [];
+
+    /// <summary>
+    /// 恢复日志用的身份：**这把风扇对应的固件表**，不是显示名。
+    ///
+    /// 0 号固定对 CPU 表（0x0F00 起）、1 号固定对 GPU 表（0x0F30 起），这是固件定的硬件通道；
+    /// 显示名以后改名或换语言，未完成的恢复记录照样对得上。旧版本按显示名记下的记录，
+    /// 由恢复日志的旧身份兼容规则认领（见 TemporaryTakeoverJournal）。
+    /// </summary>
+    public string? RecoveryIdentity(int fanIndex)
+        => fanIndex is 0 or 1 ? $"ec-fan-table-0x{UniwillFanTable.AddressesFor(fanIndex).End:X4}" : null;
+
+    public IReadOnlyCollection<int> SharedTakeoverHolders
+    {
+        get { lock (holdersGate) return sharedModeHolders.ToArray(); }
+    }
+
+    /// <summary>Releasing one fan keeps the 0x0751 bit while another fan holds it.</summary>
+    public bool SharedTakeoverCountsHolders => true;
+
+    /// <summary>Both fans share bit 0x40 of 0x0751, so they switch to software control together.</summary>
+    public IReadOnlyList<FanControlGroup> ControlGroups { get; } =
+        [new("uniwill-shared-mode", [0, 1], FanControlGroupReason.UniwillSharedModeBit, FirmwareFixedDuty: true)];
 
     public bool TryOpen(out string? unavailableReason) => TryOpen(out _, out unavailableReason);
 
@@ -121,17 +155,23 @@ public sealed partial class UniwillWmiFanBackend : IFanBackend
             SupportsSoftwareCurve: writable,
             /*
              * **这个平台上"交给软件管"是整机一个开关。**
-             * 模式位（0x0751 的那一位）一置上，两把风扇一起脱离固件自动控制。
-             * 所以只给一把挂软件曲线时，另一把会停在当时那个转速上不再自动调。
+             * 模式位（0x0751 的那一位）一置上，两把风扇一起脱离固件自动控制，
+             * 两把的表都不再生效。这一位由正在接管的风扇共同持有，见 SharedTakeoverHolders。
              */
             SoftwareTakeoverCoversAllFans: true,
             CurvePoints: UniwillFanTable.ZoneCount - 1,
+            /*
+             * 硬件死区：0 以上、20% 以下电机转不起来，DutyFromPercent 会把它抬到 20%。
+             * 报出来，软件曲线引擎的死区规则（取中点，要么到 20、要么停）才生效，
+             * 宿主的定速下限也照它定 —— 不报的话界面显示 5%，风扇实际在 20%。
+             */
+            MinimumOnPercent: (int)UniwillFanProfileTable.MinimumRunningPercent,
             SupportsFirmwareCurveReset: true);
 
     /// <summary>
     /// 软件曲线的执行器：**直接写占空比寄存器**，不动固件那张表。
     ///
-    /// 和 <see cref="TrySetDuty"/> 走的是两条路，这是故意的：
+    /// 和 <see cref="TrySetDuty(int, double, out string?)"/> 走的是两条路，这是故意的：
     /// 固定转速走固件表（写一次就一直有效，我们退了也还在），
     /// 而软件曲线每 0.1 秒就要写一次 —— 每秒十次去重排固件的 16 区表，
     /// 既慢又毫无必要。这条路是 TUXEDO 参考实现用的那条，实测立刻生效
@@ -140,45 +180,49 @@ public sealed partial class UniwillWmiFanBackend : IFanBackend
     /// 代价是**风扇归我们按着**：全速模式位一置上，固件就不再自动调速了，
     /// 所以退出时必须交还 —— 那件事由核心统一负责。
     /// </summary>
-    private bool TryDriveDutyCore(int fanIndex, double percent, out string? failureReason)
+    private bool TryDriveDutyCore(int fanIndex, double percent, out FanCommandErrorKind errorKind,
+        out string? failureReason)
     {
-        if (!TryResolveDutyAddress(fanIndex, out var address, out failureReason))
+        if (!TryResolveDutyAddress(fanIndex, out var address, out errorKind, out failureReason))
         {
             return false;
         }
         if (!double.IsFinite(percent))
         {
-            failureReason = "占空比得是个数。";
-            return false;
+            return Fail(FanCommandErrorKind.InvalidRequest, "占空比得是个数。", out errorKind, out failureReason);
         }
 
         /*
          * 先置上"由我们直接给定转速"，否则固件照它自己的逻辑走，写了也不算数。
          *
-         * **这一位是整机共用的**：置上之后**两个风扇一起**脱离固件自动控制，
-         * 各自跟着自己的占空比寄存器走。所以只给一把风扇挂软件曲线时，
-         * 另一把会停在它当时那个占空比上不再自动调 —— 这是这个平台的固有约束，
-         * 不是我们能在这一层解决的。
+         * **这一位是整机共用的**：置上之后两把风扇一起脱离固件自动控制。
+         * 置位之前先记下这把风扇持有它 —— 置位失败时这一位也可能已经变了，
+         * 交还时要照样把它算进去。
+         *
+         * 需实机确认（REVIEW B-M2）：置位之后，没有被直接写占空比的那把风扇
+         * 是跟着它自己的占空比寄存器（0x1804/0x1809）走，还是被拉满，
+         * 本文件的旧注释两种说法都有。行为没有改，只是不再断言其中一种。
          *
          * 也正因为如此，这台机器上**默认走固件曲线**：那条路没有这个副作用。
+         *
+         * 另一把正跑着我们的临时定速表时，置位会让那张表悄悄失效 —— 先拒绝，一个字节都不写。
          */
+        if (!EnsureNoOtherTemporaryTable(fanIndex, out errorKind, out failureReason)) return false;
+        ClaimSharedMode(fanIndex);
         if (!transport.WriteBit(
                 UniwillFanProfileTable.FanModeRegister,
                 UniwillFanProfileTable.FullFanModeBit,
                 set: true))
         {
-            failureReason = "切不到直接给定转速的模式。";
-            return false;
+            return Fail(FanCommandErrorKind.HardwareFailed, "切不到直接给定转速的模式。", out errorKind, out failureReason);
         }
         if (!transport.WriteWithRetry(
                 address,
                 UniwillFanProfileTable.DutyFromPercent(Math.Clamp(percent, 0, 100))))
         {
-            failureReason = "写占空比失败。";
-            return false;
+            return Fail(FanCommandErrorKind.HardwareFailed, "写占空比失败。", out errorKind, out failureReason);
         }
-        failureReason = null;
-        return true;
+        return Succeed(out errorKind, out failureReason);
     }
 
     /// <summary>
@@ -189,11 +233,11 @@ public sealed partial class UniwillWmiFanBackend : IFanBackend
     ///
     /// **注意：读得到不等于它正在生效。** `0x07C6` 的"用自定义表"位本机默认是**关**的，
     /// 那时这张表只是躺在 EC RAM 里的默认数据，改它风扇完全不理。
-    /// 要让它变成活的，见 <see cref="TryWriteCurve"/>。
+    /// 要让它变成活的，见 <see cref="TryWriteCurve(int, IReadOnlyList{FanCurvePoint}, out string?)"/>。
     ///
     /// 曲线的口径是**上升阈值**：一个点 (T, P) 的意思是"温度升到 T 时转速变成 P"。
     /// 落到表上就是"第 k-1 区的结束温度 = T，第 k 区的转速 = P" ——
-    /// 和 <see cref="TryWriteCurve"/> 用的是同一个口径，两者互为逆运算。
+    /// 和写曲线用的是同一个口径，两者互为逆运算。
     ///
     /// **不能改用起始温度。** 起始温度是**下降**阈值，它和结束温度差的那两度是回差；
     /// 读的时候报下降沿、写的时候当上升沿用，读出来再写回去整条曲线就会错位一格。
@@ -275,35 +319,28 @@ public sealed partial class UniwillWmiFanBackend : IFanBackend
     private bool TryWriteCurveCore(
         int fanIndex,
         IReadOnlyList<FanCurvePoint> curve,
+        out FanCommandErrorKind errorKind,
         out string? failureReason)
     {
         ArgumentNullException.ThrowIfNull(curve);
-        if (!writable)
+        if (!TryResolveDutyAddress(fanIndex, out _, out errorKind, out failureReason))
         {
-            failureReason = "这台机器的固件没有声明支持风扇控制，只读。";
-            return false;
-        }
-        if (fanIndex is not (0 or 1))
-        {
-            failureReason = "没有这个风扇。";
             return false;
         }
 
         if (curve.Any(point => !double.IsFinite(point.TemperatureCelsius) || !double.IsFinite(point.Percent)))
         {
-            failureReason = "固件表或曲线包含无效值，未继续调整。";
-            return false;
+            return Fail(FanCommandErrorKind.InvalidRequest, "固件表或曲线包含无效值，未继续调整。",
+                out errorKind, out failureReason);
         }
 
         var ordered = curve
-            .Where(point => double.IsFinite(point.TemperatureCelsius)
-                && double.IsFinite(point.Percent))
             .OrderBy(point => point.TemperatureCelsius)
             .ToArray();
         if (ordered.Length == 0 || ordered.Length > UniwillFanTable.ZoneCount - 1)
         {
-            failureReason = $"曲线要有 1 到 {UniwillFanTable.ZoneCount - 1} 个点。";
-            return false;
+            return Fail(FanCommandErrorKind.InvalidRequest, $"曲线要有 1 到 {UniwillFanTable.ZoneCount - 1} 个点。",
+                out errorKind, out failureReason);
         }
 
         var temperatures = new List<byte>(ordered.Length);
@@ -323,16 +360,17 @@ public sealed partial class UniwillWmiFanBackend : IFanBackend
         }
         if (temperatures.Count == 0)
         {
-            failureReason = "曲线里没有温度递增的点。";
-            return false;
+            return Fail(FanCommandErrorKind.InvalidRequest, "曲线里没有温度递增的点。", out errorKind, out failureReason);
         }
 
         var zones = UniwillFanTable.LayOut(temperatures, duties);
         var (endBase, startBase, speedBase) = UniwillFanTable.AddressesFor(fanIndex);
 
-        if (!TryPrepareTable(fanIndex, curve: true, out failureReason)) return false;
+        // 固件曲线要清掉整机模式位才生效；另一把还持有它时先说清楚，不碰任何东西。
+        if (!EnsureNoOtherHolder(fanIndex, out errorKind, out failureReason)) return false;
+        if (!TryPrepareTable(fanIndex, curve: true, out errorKind, out failureReason)) return false;
         // **先让固件开始查表，再写内容。** 见 ActivateTable 上那段。
-        if (!ActivateTable(out failureReason))
+        if (!ActivateTable(fanIndex, out errorKind, out failureReason))
         {
             return false;
         }
@@ -342,8 +380,8 @@ public sealed partial class UniwillWmiFanBackend : IFanBackend
         {
             if (!transport.WriteWithRetry((ushort)(speedBase + zone), zones[zone].Speed))
             {
-                failureReason = $"写转速失败（第 {zone} 区）。";
-                return false;
+                return Fail(FanCommandErrorKind.HardwareFailed, $"写转速失败（第 {zone} 区）。",
+                    out errorKind, out failureReason);
             }
         }
         for (var zone = 0; zone < UniwillFanTable.ZoneCount; zone++)
@@ -351,12 +389,12 @@ public sealed partial class UniwillWmiFanBackend : IFanBackend
             if (!transport.WriteWithRetry((ushort)(startBase + zone), zones[zone].Start)
                 || !transport.WriteWithRetry((ushort)(endBase + zone), zones[zone].End))
             {
-                failureReason = $"写温度阈值失败（第 {zone} 区）。";
-                return false;
+                return Fail(FanCommandErrorKind.HardwareFailed, $"写温度阈值失败（第 {zone} 区）。",
+                    out errorKind, out failureReason);
             }
         }
 
-        return TryCompleteCurve(fanIndex, out failureReason);
+        return TryCompleteCurve(fanIndex, out errorKind, out failureReason);
     }
 
     /// <summary>
@@ -376,31 +414,49 @@ public sealed partial class UniwillWmiFanBackend : IFanBackend
     ///
     /// <list type="number">
     /// <item>置上"用自定义表"位。本机默认是**关**的，不是开的。</item>
-    /// <item>清掉全速模式位 —— 那一位置着时固件直接给满速，根本不查表。</item>
+    /// <item>清掉全速模式位 —— 那一位置着时固件根本不查表。调用方已经确认
+    ///   没有别的风扇持有它（<see cref="EnsureNoOtherHolder"/>），这把风扇自己的那一份在这里放下。</item>
     /// </list>
     ///
     /// **不去动 <see cref="UniwillFanTable.SeparateTablesRegister"/>（0x07C5）。**
     /// 实测它全程是 0，而 CPU 表和 GPU 表本来就各自生效 —— 它不影响分表。
     /// 旧实现坚持先置这一位、置不上就整个放弃，那是走错了路。
     /// </summary>
-    private bool ActivateTable(out string? failureReason)
+    private bool ActivateTable(int fanIndex, out FanCommandErrorKind errorKind, out string? failureReason)
     {
         if (!SetBit(
                 UniwillFanTable.UseCustomTablesRegister,
                 UniwillFanTable.UseCustomTablesBit,
+                out errorKind,
                 out failureReason))
         {
             return false;
         }
-        return ClearFullFanMode(out failureReason);
+        // 清位成功后才放下这把的持有：清不掉时位还置着，它仍算持有者，别的风扇照旧被拒、回执也不会报 firmware。
+        if (!ClearFullFanMode(out errorKind, out failureReason)) return false;
+        lock (holdersGate) sharedModeHolders.Remove(fanIndex);
+        return true;
     }
 
+    /// <summary>
+    /// 现在的状态。
+    ///
+    /// **"自动"要如实报**：模式寄存器读不到就是 null（读不到不是"自动"）；
+    /// 模式位置着时两把都不是自动（整机开关）；模式位清着时，跑着我们临时定速表的那把
+    /// 也不是自动 —— 定速就是写表实现的，模式位本来就是清的，只看模式位会把定速报成自动。
+    /// 临时表的事实来自恢复基线文件，读不出来同样是 null。
+    /// </summary>
     public IReadOnlyList<FanState> Read()
     {
         var mode = transport.Read(UniwillFanProfileTable.FanModeRegister);
-        // 全速模式位置着，说明现在是我们（或者别的什么）在直接给定转速。
-        var automatic = mode is null
-            || (mode.Value & UniwillFanProfileTable.FullFanModeBit) == 0;
+        bool? sharedTakeover = mode is { } value ? (value & UniwillFanProfileTable.FullFanModeBit) != 0 : null;
+        var temporaryTables = sharedTakeover == false ? TemporaryTableFans() : null;
+        bool? Automatic(int fanIndex) => sharedTakeover switch
+        {
+            null => null,
+            true => false,
+            false => temporaryTables is null ? null : !temporaryTables.Contains(fanIndex)
+        };
 
         return
         [
@@ -410,14 +466,14 @@ public sealed partial class UniwillWmiFanBackend : IFanBackend
                 UniwillFanProfileTable.MainFanRpmHigh,
                 UniwillFanProfileTable.MainFanRpmLow,
                 UniwillFanProfileTable.MainFanPwm,
-                automatic),
+                Automatic(0)),
             ReadFan(
                 1,
                 "副风扇",
                 UniwillFanProfileTable.SecondFanRpmHigh,
                 secondFanRpmLow,
                 UniwillFanProfileTable.SecondFanPwm,
-                automatic)
+                Automatic(1))
         ];
     }
 
@@ -439,26 +495,32 @@ public sealed partial class UniwillWmiFanBackend : IFanBackend
     /// </list>
     ///
     /// 也不需要"0 区 + 哑区"那套把表填成水平线的花招：表就在跑，原地改就是了。
+    ///
+    /// 0 以上、20% 以下会被抬到 20%（硬件死区，Describe 报为 MinimumOnPercent），
+    /// 字节量化是 0.5%；<paramref name="appliedPercent"/> 报实际下发的那个百分比。
     /// </summary>
-    private bool TrySetDutyCore(int fanIndex, double percent, out string? failureReason)
+    private bool TrySetDutyCore(int fanIndex, double percent, out double? appliedPercent,
+        out FanCommandErrorKind errorKind, out string? failureReason)
     {
-        if (!TryResolveDutyAddress(fanIndex, out _, out failureReason))
+        appliedPercent = null;
+        if (!TryResolveDutyAddress(fanIndex, out _, out errorKind, out failureReason))
         {
             return false;
         }
         if (!double.IsFinite(percent))
         {
-            failureReason = "占空比得是个数。";
-            return false;
+            return Fail(FanCommandErrorKind.InvalidRequest, "占空比得是个数。", out errorKind, out failureReason);
         }
 
         var duty = UniwillFanProfileTable.DutyFromPercent(Math.Clamp(percent, 0, 100));
         var (_, _, speedBase) = UniwillFanTable.AddressesFor(fanIndex);
 
-        if (!TryPrepareTable(fanIndex, curve: false, out failureReason)) return false;
+        // 定速表要清掉整机模式位才生效；另一把还持有它时先说清楚，不碰任何东西。
+        if (!EnsureNoOtherHolder(fanIndex, out errorKind, out failureReason)) return false;
+        if (!TryPrepareTable(fanIndex, curve: false, out errorKind, out failureReason)) return false;
 
         // **先让固件开始查表，再写内容。** 反过来的话它会在使能的那一刻重载默认表。
-        if (!ActivateTable(out failureReason))
+        if (!ActivateTable(fanIndex, out errorKind, out failureReason))
         {
             return false;
         }
@@ -480,76 +542,135 @@ public sealed partial class UniwillWmiFanBackend : IFanBackend
         {
             if (!transport.WriteWithRetry((ushort)(speedBase + zone), duty))
             {
-                failureReason = $"写转速失败（第 {zone} 区）。";
-                return false;
+                return Fail(FanCommandErrorKind.HardwareFailed, $"写转速失败（第 {zone} 区）。",
+                    out errorKind, out failureReason);
             }
         }
 
-        failureReason = null;
-        return true;
+        appliedPercent = UniwillFanProfileTable.PercentFromDuty(duty);
+        return Succeed(out errorKind, out failureReason);
     }
 
-    private bool SetBit(ushort address, byte bit, out string? failureReason)
-        => WriteBit(address, bit, set: true, out failureReason);
+    private bool SetBit(ushort address, byte bit, out FanCommandErrorKind errorKind, out string? failureReason)
+        => WriteBit(address, bit, set: true, out errorKind, out failureReason);
 
-    private bool ClearBit(ushort address, byte bit, out string? failureReason)
-        => WriteBit(address, bit, set: false, out failureReason);
-
-    private bool WriteBit(ushort address, byte bit, bool set, out string? failureReason)
+    private bool WriteBit(ushort address, byte bit, bool set, out FanCommandErrorKind errorKind,
+        out string? failureReason)
     {
         if (transport.WriteBit(address, bit, set))
         {
-            failureReason = null;
-            return true;
+            return Succeed(out errorKind, out failureReason);
         }
-        failureReason = $"改不了 0x{address:X4} 的第 0x{bit:X2} 位。";
-        return false;
+        return Fail(FanCommandErrorKind.HardwareFailed, $"改不了 0x{address:X4} 的第 0x{bit:X2} 位。",
+            out errorKind, out failureReason);
     }
 
-    private bool ClearFullFanMode(out string? failureReason)
-        => ClearBit(
+    private bool ClearFullFanMode(out FanCommandErrorKind errorKind, out string? failureReason)
+        => WriteBit(
             UniwillFanProfileTable.FanModeRegister,
             UniwillFanProfileTable.FullFanModeBit,
+            set: false,
+            out errorKind,
             out failureReason);
 
-    /// <summary>全速。置上那一位，两个风扇一起拉满 —— 这个位是整机共用的。</summary>
-    private bool TrySetFullSpeedCore(int fanIndex, out string? failureReason)
+    /// <summary>这把风扇开始持有整机模式位。在置位之前调，失败的尝试也算持有。</summary>
+    private void ClaimSharedMode(int fanIndex)
     {
-        if (!TryResolveDutyAddress(fanIndex, out _, out failureReason))
+        lock (holdersGate) sharedModeHolders.Add(fanIndex);
+    }
+
+    /// <summary>
+    /// 这把风扇放下它持有的那一份。**还有别的风扇持有时不清位**：清了的话，
+    /// 那把正在软件驱动或全速的风扇会悄悄回到固件表，而引擎和回执都不知道。
+    /// 没有任何持有者（包括进程重启后内存里没有记录）时才清位。
+    /// </summary>
+    private bool ReleaseSharedMode(int fanIndex, out FanCommandErrorKind errorKind, out string? failureReason)
+    {
+        lock (holdersGate)
+        {
+            if (sharedModeHolders.Any(holder => holder != fanIndex))
+            {
+                sharedModeHolders.Remove(fanIndex);
+                return Succeed(out errorKind, out failureReason);
+            }
+        }
+        // 最后一份：清位成功后才放下，清不掉就仍算持有（见 ActivateTable）。
+        if (!ClearFullFanMode(out errorKind, out failureReason)) return false;
+        lock (holdersGate) sharedModeHolders.Remove(fanIndex);
+        return true;
+    }
+
+    /// <summary>
+    /// 置整机模式位（软件驱动、全速）之前：另一把正跑着我们的临时定速表时拒绝，因为置位会让那张表悄悄失效。
+    /// 临时表的事实读不出来时同样拒绝（StateUnavailable）—— 不知道就不冒险。
+    /// </summary>
+    private bool EnsureNoOtherTemporaryTable(int fanIndex, out FanCommandErrorKind errorKind, out string? failureReason)
+    {
+        if (TemporaryTableFans() is not { } temporary)
+            return Fail(FanCommandErrorKind.StateUnavailable, BaselineUnavailable, out errorKind, out failureReason);
+        var others = temporary.Where(fan => fan != fanIndex).Order().ToArray();
+        if (others.Length == 0) return Succeed(out errorKind, out failureReason);
+        return Fail(FanCommandErrorKind.SharedTakeoverHeld,
+            $"风扇 {string.Join("、", others)} 正跑着临时定速；这台机器上软件接管和全速是整机一个开关，会让那把的定速悄悄失效，未做任何改动。先让那把交还（auto）再接管。",
+            out errorKind, out failureReason);
+    }
+
+    /// <summary>会清位的写入（定速表、固件曲线）只在没有别的风扇持有整机模式位时进行。</summary>
+    private bool EnsureNoOtherHolder(int fanIndex, out FanCommandErrorKind errorKind, out string? failureReason)
+    {
+        int[] others;
+        lock (holdersGate) others = sharedModeHolders.Where(holder => holder != fanIndex).Order().ToArray();
+        if (others.Length == 0) return Succeed(out errorKind, out failureReason);
+        return Fail(FanCommandErrorKind.SharedTakeoverHeld,
+            $"风扇 {string.Join("、", others)} 正由软件或全速接管整机模式位；这台机器上定速和固件曲线要先结束那一把的接管才能生效。",
+            out errorKind, out failureReason);
+    }
+
+    /// <summary>
+    /// 全速：置上整机模式位。
+    ///
+    /// 需实机确认（REVIEW B-M2）：旧注释说"两个风扇一起拉满"，而软件驱动那边的注释说
+    /// 置位后各自跟着自己的占空比寄存器走 —— 若是后者，这里给出的是占空比寄存器里残留的值，
+    /// 不一定是满速。行为没有改。
+    /// </summary>
+    private bool TrySetFullSpeedCore(int fanIndex, out FanCommandErrorKind errorKind, out string? failureReason)
+    {
+        if (!TryResolveDutyAddress(fanIndex, out _, out errorKind, out failureReason))
         {
             return false;
         }
+        if (!EnsureNoOtherTemporaryTable(fanIndex, out errorKind, out failureReason)) return false;
+        ClaimSharedMode(fanIndex);
         if (!transport.WriteBit(
                 UniwillFanProfileTable.FanModeRegister,
                 UniwillFanProfileTable.FullFanModeBit,
                 set: true))
         {
-            failureReason = "切不到全速模式。";
-            return false;
+            return Fail(FanCommandErrorKind.HardwareFailed, "切不到全速模式。", out errorKind, out failureReason);
         }
-        failureReason = null;
-        return true;
+        return Succeed(out errorKind, out failureReason);
     }
 
-    private bool TrySetAutomaticCore(int fanIndex, out string? failureReason)
+    private bool TrySetAutomaticCore(int fanIndex, out FanCommandErrorKind errorKind, out string? failureReason)
     {
-        if (!TryResolveDutyAddress(fanIndex, out _, out failureReason))
+        if (!TryResolveDutyAddress(fanIndex, out _, out errorKind, out failureReason))
         {
             return false;
         }
-        return TryRestoreOwnedTable(fanIndex, resetCurve: false, out failureReason);
+        return TryRestoreOwnedTable(fanIndex, resetCurve: false, out errorKind, out failureReason);
     }
 
     private bool TryResolveDutyAddress(
         int fanIndex,
         out ushort dutyAddress,
+        out FanCommandErrorKind errorKind,
         out string? failureReason)
     {
         dutyAddress = 0;
         if (!writable)
         {
-            failureReason = "这台机器的固件没有声明支持风扇控制，只读。";
-            return false;
+            return Fail(FanCommandErrorKind.ReadOnly, "这台机器的固件没有声明支持风扇控制，只读。",
+                out errorKind, out failureReason);
         }
         switch (fanIndex)
         {
@@ -560,9 +681,22 @@ public sealed partial class UniwillWmiFanBackend : IFanBackend
                 dutyAddress = UniwillFanProfileTable.SecondFanDuty;
                 break;
             default:
-                failureReason = "没有这个风扇。";
-                return false;
+                return Fail(FanCommandErrorKind.NoSuchFan, "没有这个风扇。", out errorKind, out failureReason);
         }
+        return Succeed(out errorKind, out failureReason);
+    }
+
+    private static bool Fail(FanCommandErrorKind kind, string reason, out FanCommandErrorKind errorKind,
+        out string? failureReason)
+    {
+        errorKind = kind;
+        failureReason = reason;
+        return false;
+    }
+
+    private static bool Succeed(out FanCommandErrorKind errorKind, out string? failureReason)
+    {
+        errorKind = FanCommandErrorKind.Other;
         failureReason = null;
         return true;
     }
@@ -573,7 +707,7 @@ public sealed partial class UniwillWmiFanBackend : IFanBackend
         ushort rpmHigh,
         ushort rpmLow,
         ushort pwmAddress,
-        bool automatic)
+        bool? automatic)
     {
         // 高低字节由 profile 分别指定；OEM 副风扇的低字节地址可以在高字节之前。
         var rpm = transport.ReadBigEndianWord(rpmHigh, rpmLow);

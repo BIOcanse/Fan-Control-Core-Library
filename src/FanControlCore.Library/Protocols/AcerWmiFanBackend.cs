@@ -111,10 +111,20 @@ public sealed class AcerWmiFanBackend : IFanBackend
                 Role: Fans[index].Role,
                 // 主线 acer-wmi 对支持 PWM 的机型能独立写 CPU/GPU 0-100%，
                 // 但**没有**通用的固件曲线表接口。所以曲线由我们自己跑。
-                SupportsSoftwareCurve: true, SoftwareTakeoverCoversAllFans: true));
+                SupportsSoftwareCurve: true, SoftwareTakeoverCoversAllFans: true,
+                // 自定义转速只收 20 到 100（见 TrySetDuty）：0 写不进去，不能经它停转。
+                MinimumOnPercent: (int)MinimumDutyPercent, CanStop: false));
         }
         return descriptions;
     }
+
+    /// <summary>
+    /// 自定义模式是整机一个 WMI 模式，交还自动也是整机：所有风扇一组。定速本身就是切到自定义模式，
+    /// 所以组在固件控制下不能单独给一把定速。
+    /// </summary>
+    public IReadOnlyList<FanControlGroup> ControlGroups =>
+        [new("acer-machine-mode", Enumerable.Range(0, Fans.Length).ToArray(), FanControlGroupReason.AcerMachineMode,
+            FirmwareFixedDuty: false)];
 
     public IReadOnlyList<FanState> Read()
     {
